@@ -13,7 +13,6 @@ import vllm.model_executor.models.rwkv7 as rwkv7
 from vllm.config.compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.config import RWKV7ForCausalLMConfig
-from vllm.model_executor.models.interfaces import supports_pp
 from vllm.model_executor.models.rwkv7 import RWKV7ForCausalLM
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
