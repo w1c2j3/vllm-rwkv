@@ -235,6 +235,12 @@ def build_app(
 
     register_models_api_router(app)
 
+    from vllm.entrypoints.openai.helicopter_attestation import (
+        attach_router as attach_helicopter_attestation,
+    )
+
+    attach_helicopter_attestation(app, args.helicopter_attestation_json)
+
     if build_profile.profile == "full":
         from vllm.entrypoints.serve.sagemaker.api_router import (
             attach_router as register_sagemaker_api_router,

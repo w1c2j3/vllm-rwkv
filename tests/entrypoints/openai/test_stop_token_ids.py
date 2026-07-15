@@ -108,6 +108,36 @@ class TestChatCompletionStopTokenIds:
         assert len(sampling_params.stop_token_ids) == 3
 
 
+class TestChatCompletionStopStrings:
+    def test_client_stops_are_merged_with_rwkv_server_defaults(self):
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            stop=["\n\nQuestion:"],
+        )
+
+        sampling_params = request.to_sampling_params(
+            max_tokens=100,
+            default_sampling_params={"stop": ["\nUser:"]},
+        )
+
+        assert sampling_params.stop == ["\n\nQuestion:", "\nUser:"]
+
+    def test_duplicate_stop_strings_are_deduplicated_without_reordering(self):
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            stop=["\nUser:", "custom"],
+        )
+
+        sampling_params = request.to_sampling_params(
+            max_tokens=100,
+            default_sampling_params={"stop": ["\nUser:"]},
+        )
+
+        assert sampling_params.stop == ["\nUser:", "custom"]
+
+
 class TestCompletionStopTokenIds:
     """Test stop_token_ids merging in CompletionRequest.to_sampling_params()."""
 

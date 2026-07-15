@@ -561,7 +561,8 @@ class VllmConfig:
 
         if not self._is_default_v2_model_runner_model():
             if self._is_rwkv7_model():
-                raise ValueError("RWKV7ForCausalLM requires Model Runner V2.")
+                self._raise_rwkv7_unsupported_features()
+                return True
             return False
 
         if not HAS_TRITON:

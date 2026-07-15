@@ -631,17 +631,23 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
         stop = self.stop
-        if not stop and "stop" not in self.model_fields_set:
-            stop = default_sampling_params.get("stop", stop)
-        if isinstance(stop, list):
+        default_stop = default_sampling_params.get("stop")
+        if default_stop:
+            requested_stops = [stop] if isinstance(stop, str) else list(stop or [])
+            default_stops = (
+                [default_stop] if isinstance(default_stop, str) else list(default_stop)
+            )
+            stop = list(dict.fromkeys([*requested_stops, *default_stops]))
+        elif isinstance(stop, list):
             stop = list(stop)
 
         stop_token_ids = self.stop_token_ids
-        if not stop_token_ids and "stop_token_ids" not in self.model_fields_set:
-            stop_token_ids = default_sampling_params.get(
-                "stop_token_ids", stop_token_ids
+        default_stop_ids = default_sampling_params.get("stop_token_ids")
+        if default_stop_ids:
+            stop_token_ids = list(
+                dict.fromkeys([*(stop_token_ids or []), *default_stop_ids])
             )
-        if isinstance(stop_token_ids, list):
+        elif isinstance(stop_token_ids, list):
             stop_token_ids = list(stop_token_ids)
 
         prompt_logprobs = self.prompt_logprobs

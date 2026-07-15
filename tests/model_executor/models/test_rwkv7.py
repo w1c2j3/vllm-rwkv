@@ -2216,12 +2216,12 @@ def test_rwkv7_model_state_dummy_batch_uses_scratch_state():
     assert torch.all(state.elapsed == 3)
 
 
-def test_rwkv7_model_state_requires_rapid_sampler():
+def test_rwkv7_model_state_keeps_native_fallback_for_unsupported_requests():
     state = object.__new__(RWKV7ModelState)
     sampler = SimpleNamespace(use_rapid=True, require_rapid=False)
 
     assert state.custom_sampler(sampler) == (sampler, None)
-    assert sampler.require_rapid is True
+    assert sampler.require_rapid is False
 
 
 def test_rwkv7_model_state_rejects_unavailable_rapid_sampler():

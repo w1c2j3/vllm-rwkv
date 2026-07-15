@@ -293,6 +293,7 @@ class RWKVTokenizer(TokenizerLike):
         tools: list[dict[str, Any]] | None = None,
         chat_template: str | None = None,
         tokenize: bool = False,
+        rwkv_generation_prompt: str = "open_think",
         **kwargs,
     ) -> str | list[int]:
         conversation = (
@@ -308,10 +309,7 @@ class RWKVTokenizer(TokenizerLike):
                 list(conversation),
                 tools,
                 add_generation_prompt=bool(kwargs.get("add_generation_prompt", False)),
-                rwkv_generation_prompt=kwargs.get(
-                    "rwkv_generation_prompt",
-                    "open_think",
-                ),
+                rwkv_generation_prompt=rwkv_generation_prompt,
             )
         else:
             rendered, _ = hf_chat_utils.render_jinja_template(

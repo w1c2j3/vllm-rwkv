@@ -168,6 +168,14 @@ class BaseFrontendArgs:
     """
     fingerprint_value: str | None = None
     """Literal fingerprint string used when ``--fingerprint-mode=custom``."""
+    helicopter_attestation_json: str | None = None
+    """Validated evaluation identity exposed at ``/v1/helicopter/attestation``.
+
+    Official evaluation launches must pass a JSON object containing immutable
+    model, checkpoint, tokenizer, chat-template, server, precision, WKV, GEMM,
+    launch-contract and capability identities. The endpoint is absent when this
+    argument is not supplied.
+    """
 
     @classmethod
     def _customize_cli_kwargs(

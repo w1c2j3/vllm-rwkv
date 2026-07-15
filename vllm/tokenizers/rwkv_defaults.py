@@ -11,7 +11,7 @@ from vllm.transformers_utils.configs.rwkv7 import build_rwkv7_config_from_pth
 
 RWKV_NATIVE_CHAT_TEMPLATE = "{# RWKV native chat template #}"
 RWKV_TOOL_CALL_PARSER = "rwkv"
-RWKV_DEFAULT_STOPS = ("\nUser:", "\n### User")
+RWKV_DEFAULT_STOPS = ("\nUser:",)
 RWKV_DEFAULT_STOP = RWKV_DEFAULT_STOPS[0]
 RWKV_DEFAULT_STOP_TOKEN_IDS = (0,)
 RWKV_GENERATION_PROMPT_OPEN_THINK = "open_think"
@@ -234,7 +234,7 @@ def _generation_prompt_text(mode: str) -> str:
     if mode == RWKV_GENERATION_PROMPT_OPEN_THINK:
         return "<think"
     if mode == RWKV_GENERATION_PROMPT_FAKE_THINK:
-        return "<think></think"
+        return "<think></think>"
     _check_generation_prompt(mode)
     raise AssertionError("unreachable")
 

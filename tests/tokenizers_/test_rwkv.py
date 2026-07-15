@@ -133,7 +133,21 @@ def test_rwkv_chat_template_can_render_fake_think_generation_prompt():
         rwkv_generation_prompt="fake_think",
     )
 
-    assert rendered == "User: Hi\n\nAssistant: <think></think"
+    assert rendered == "User: Hi\n\nAssistant: <think></think>"
+
+
+def test_rwkv_generation_prompt_is_an_explicit_renderer_parameter():
+    from vllm.renderers.hf import resolve_chat_template_kwargs
+
+    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+
+    resolved = resolve_chat_template_kwargs(
+        tokenizer,
+        tokenizer.get_chat_template(),
+        {"rwkv_generation_prompt": "fake_think"},
+    )
+
+    assert resolved == {"rwkv_generation_prompt": "fake_think"}
 
 
 def test_rwkv_chat_template_strips_dapo_math_prompt_wrapper():
