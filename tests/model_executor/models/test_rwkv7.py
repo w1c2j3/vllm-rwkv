@@ -2870,8 +2870,8 @@ def test_rwkv7_vllm_pp_non_last_stage_returns_v_first(monkeypatch):
     model.end_layer = 1
     model._is_pp_first_rank = lambda: True
     model._is_pp_last_rank = lambda: False
-    model.embed = (
-        lambda tokens: tokens.to(torch.float32).unsqueeze(-1).expand(-1, -1, 3)
+    model.embed = lambda tokens: (
+        tokens.to(torch.float32).unsqueeze(-1).expand(-1, -1, 3)
     )
     seen_groups = []
 
@@ -2942,8 +2942,8 @@ def test_rwkv7_vllm_pp_non_last_stage_all_gathers_tp_v_first(monkeypatch):
     model.tp_hidden_size = 2
     model._is_pp_first_rank = lambda: True
     model._is_pp_last_rank = lambda: False
-    model.embed = (
-        lambda tokens: tokens.to(torch.float32).unsqueeze(-1).expand(-1, -1, 4)
+    model.embed = lambda tokens: (
+        tokens.to(torch.float32).unsqueeze(-1).expand(-1, -1, 4)
     )
 
     def fake_all_gather(value):
