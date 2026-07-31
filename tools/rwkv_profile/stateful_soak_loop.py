@@ -64,6 +64,7 @@ def main() -> int:
     ]
     deadline = time.monotonic() + args.duration_s
     cycle = 0
+    failed_cycles = 0
 
     while time.monotonic() < deadline:
         cycle += 1
@@ -71,6 +72,8 @@ def main() -> int:
         print(f"soak_cycle_start cycle={cycle} at={started}", flush=True)
         cycle_start = time.monotonic()
         result = subprocess.run(command, check=False)
+        if result.returncode != 0:
+            failed_cycles += 1
         elapsed = time.monotonic() - cycle_start
         print(
             f"soak_cycle_end cycle={cycle} returncode={result.returncode} "
@@ -81,8 +84,11 @@ def main() -> int:
         if remaining > 0:
             time.sleep(min(args.interval_s, remaining))
 
-    print(f"soak_finished cycles={cycle}", flush=True)
-    return 0
+    print(
+        f"soak_finished cycles={cycle} failed_cycles={failed_cycles}",
+        flush=True,
+    )
+    return 1 if failed_cycles else 0
 
 
 if __name__ == "__main__":

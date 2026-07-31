@@ -25,9 +25,7 @@ logger = init_logger(__name__)
 
 @dataclass
 class _RWKVSession:
-    session_id: str
     row: int
-    state_version: int = 0
     processed_token_count: int = 0
     last_active_at: float = 0.0
     status: str = "active"
@@ -303,12 +301,10 @@ class RWKV7ModelState(ModelState):
             self.req_slot_to_row[req_index] = row
             self.row_to_req_slot[row] = req_index
             logger.debug(
-                "RWKV stateful request attached: session_id=%s request_id=%s "
-                "row=%d state_version=%d",
+                "RWKV stateful request attached: session_id=%s request_id=%s row=%d",
                 session_id,
                 new_req_data.req_id,
                 row,
-                session.state_version,
             )
             return
 
@@ -339,12 +335,10 @@ class RWKV7ModelState(ModelState):
             session.status = "detached"
             session.last_active_at = time.monotonic()
             logger.debug(
-                "RWKV stateful request detached: session_id=%s request_id=%s "
-                "row=%d state_version=%d",
+                "RWKV stateful request detached: session_id=%s request_id=%s row=%d",
                 session_id,
                 req_id,
                 row,
-                session.state_version,
             )
             return
         if req_index in self.decode_req_slots:
@@ -365,7 +359,6 @@ class RWKV7ModelState(ModelState):
         row = min(self.free_rows)
         self.free_rows.remove(row)
         self.sessions[session_id] = _RWKVSession(
-            session_id=session_id,
             row=row,
             last_active_at=time.monotonic(),
         )
@@ -437,40 +430,25 @@ class RWKV7ModelState(ModelState):
                 f"session={session_id!r}, expected={session.row}, got={expected_row}"
             )
         session.processed_token_count = new_req_data.num_computed_tokens
-        session.state_version += 1
         session.last_active_at = time.monotonic()
         logger.debug(
             "RWKV stateful update retained: session_id=%s request_id=%s "
-            "processed_token_count=%d state_version=%d row=%d",
+            "processed_token_count=%d row=%d",
             session_id,
             req_id,
             session.processed_token_count,
-            session.state_version,
             session.row,
         )
-
-    def update_session(self, session_id: str, processed_token_count: int) -> None:
-        session = self.sessions.get(session_id)
-        if session is None:
-            raise KeyError(f"Unknown RWKV session {session_id!r}")
-        if processed_token_count < session.processed_token_count:
-            raise ValueError("session token position cannot move backwards")
-        session.processed_token_count = processed_token_count
-        session.state_version += 1
-        session.last_active_at = time.monotonic()
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         session = self.sessions.get(session_id)
         if session is None:
             raise KeyError(f"Unknown RWKV session {session_id!r}")
         return {
-            "session_id": session.session_id,
+            "session_id": session_id,
             "processed_token_count": session.processed_token_count,
-            "state_version": session.state_version,
-            "last_active_at": session.last_active_at,
             "status": session.status,
             "request_id": session.request_id,
-            "row": session.row,
         }
 
     def reset_session(self, session_id: str) -> None:
@@ -483,7 +461,6 @@ class RWKV7ModelState(ModelState):
             )
         self._zero_row(session.row)
         session.processed_token_count = 0
-        session.state_version += 1
         session.status = "reset"
         session.last_active_at = time.monotonic()
 

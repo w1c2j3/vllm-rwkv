@@ -69,17 +69,25 @@ async def _load_test(
 
 
 def _load_summary(results: list[RequestResult]) -> dict:
+    if not results:
+        return {
+            "requests": 0,
+            "successes": 0,
+            "errors": 0,
+            "passed": False,
+        }
     elapsed = sorted(result.elapsed_s for result in results)
-    successes = [result for result in results if result.status_code == 200]
+    successes = sum(result.status_code == 200 for result in results)
     p95_index = min(len(elapsed) - 1, max(0, int(len(elapsed) * 0.95) - 1))
     return {
         "requests": len(results),
-        "successes": len(successes),
-        "errors": len(results) - len(successes),
+        "successes": successes,
+        "errors": len(results) - successes,
         "min_s": min(elapsed),
         "mean_s": statistics.mean(elapsed),
         "p95_s": elapsed[p95_index],
         "max_s": max(elapsed),
+        "passed": successes == len(results),
     }
 
 
@@ -128,6 +136,7 @@ async def _session_test(
             "continuation_status": continuation.status_code,
             "create_response": create.body,
             "continuation_response": continuation.body,
+            "passed": False,
         }
     status_before_reset = await client.get(session_url)
     reset = await client.post(f"{session_url}/reset")
@@ -144,6 +153,18 @@ async def _session_test(
         "status_after_delete": status_after_delete.status_code,
         "create_response": create.body,
         "continuation_response": continuation.body,
+        "passed": all(
+            status == expected
+            for status, expected in (
+                (create.status_code, 200),
+                (continuation.status_code, 200),
+                (status_before_reset.status_code, 200),
+                (reset.status_code, 200),
+                (status_after_reset.status_code, 200),
+                (delete.status_code, 200),
+                (status_after_delete.status_code, 404),
+            )
+        ),
     }
 
 
@@ -192,6 +213,7 @@ async def _tool_test(
         "tool_calls": message.get("tool_calls"),
         "content": message.get("content"),
         "response": result.body,
+        "passed": result.status_code == 200 and bool(message.get("tool_calls")),
     }
 
 
@@ -223,6 +245,14 @@ async def _ttl_test(
         "evict_status": evict.status_code,
         "evict_response": evict.json(),
         "status_after_evict": status.status_code,
+        "passed": all(
+            status_code == expected
+            for status_code, expected in (
+                (create.status_code, 200),
+                (evict.status_code, 200),
+                (status.status_code, 404),
+            )
+        ),
     }
 
 
@@ -298,6 +328,15 @@ async def _stateful_tool_test(
         "continuation_status": continuation.status_code,
         "continuation_response": continuation.body,
         "delete_status": delete.status_code,
+        "passed": all(
+            status_code == expected
+            for status_code, expected in (
+                (create.status_code, 200),
+                (continuation.status_code, 200),
+                (delete.status_code, 200),
+            )
+        )
+        and bool(tool_calls),
     }
 
 
@@ -344,6 +383,15 @@ async def _recovery_test(
         "replay_create_response": replay.body,
         "status_after_replay": status.status_code,
         "delete_status": delete.status_code,
+        "passed": all(
+            status_code == expected
+            for status_code, expected in (
+                (continue_request.status_code, 410),
+                (replay.status_code, 200),
+                (status.status_code, 200),
+                (delete.status_code, 200),
+            )
+        ),
     }
 
 
@@ -394,6 +442,9 @@ async def _stateful_soak(
     summary["sessions"] = session_count
     summary["turns"] = turns
     summary["delete_successes"] = sum(status == 200 for status in delete_statuses)
+    summary["passed"] = summary["passed"] and (
+        summary["delete_successes"] == session_count
+    )
     return summary
 
 
@@ -437,10 +488,16 @@ async def _same_session_race(
         *(continue_session(index) for index in range(request_count))
     )
     delete = await client.delete(f"{base_url}/v1/rwkv/sessions/{session_id}")
+    continuation_summary = _load_summary(continuations)
     return {
         "create_status": create.status_code,
-        "continuation_summary": _load_summary(continuations),
+        "continuation_summary": continuation_summary,
         "delete_status": delete.status_code,
+        "passed": (
+            create.status_code == 200
+            and continuation_summary["passed"]
+            and delete.status_code == 200
+        ),
     }
 
 
@@ -450,7 +507,7 @@ async def _session_capacity_test(
     model: str,
     session_count: int,
 ) -> dict:
-    statuses = []
+    statuses: list[int] = []
     created_session_ids = []
     prefix = f"capacity-{int(time.time())}"
     for index in range(session_count):
@@ -472,19 +529,24 @@ async def _session_capacity_test(
         if result.status_code == 200:
             created_session_ids.append(session_id)
 
-    delete_statuses = []
+    delete_statuses: list[int] = []
     for session_id in created_session_ids:
         response = await client.delete(f"{base_url}/v1/rwkv/sessions/{session_id}")
         delete_statuses.append(response.status_code)
+    unexpected_statuses = [status for status in statuses if status not in (200, 503)]
     return {
         "attempted": session_count,
-        "statuses": statuses,
         "created": len(created_session_ids),
+        "capacity_rejections": statuses.count(503),
+        "unexpected_statuses": unexpected_statuses,
+        "delete_attempted": len(delete_statuses),
         "delete_successes": sum(status == 200 for status in delete_statuses),
+        "passed": not unexpected_statuses
+        and all(status == 200 for status in delete_statuses),
     }
 
 
-async def _main(args: argparse.Namespace) -> None:
+async def _main(args: argparse.Namespace) -> bool:
     headers = _headers(args.api_key)
     limits = httpx.Limits(
         max_connections=max(args.concurrency, 8),
@@ -554,7 +616,14 @@ async def _main(args: argparse.Namespace) -> None:
                 args.model,
                 args.capacity_sessions,
             )
+    passed = all(
+        value.get("passed", True)
+        for value in result.values()
+        if isinstance(value, dict)
+    )
+    result["passed"] = passed
     print(result)
+    return passed
 
 
 def main() -> None:
@@ -580,7 +649,7 @@ def main() -> None:
     parser.add_argument("--capacity-sessions", type=int, default=9)
     parser.add_argument("--timeout-s", type=float, default=120.0)
     args = parser.parse_args()
-    asyncio.run(_main(args))
+    raise SystemExit(0 if asyncio.run(_main(args)) else 2)
 
 
 if __name__ == "__main__":
