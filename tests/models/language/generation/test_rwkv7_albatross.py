@@ -13,27 +13,22 @@ decode path. These tests intentionally do not test registry/import presence.
 
 from __future__ import annotations
 
-import json
 import os
 import socket
 import subprocess
 import sys
 import tempfile
-import textwrap
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
-from urllib.parse import urlparse
 
 import pytest
 import requests
 import torch
 
-from vllm import SamplingParams
 from vllm.config.compilation import CUDAGraphMode
 
 TOP_K = int(os.environ.get("RWKV7_ALBATROSS_TOP_K", "20"))
