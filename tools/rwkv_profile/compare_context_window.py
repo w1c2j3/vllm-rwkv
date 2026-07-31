@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 """Run a deterministic accuracy A/B for RWKV context-window handling.
 
 The script deliberately uses the same request payloads and sampling settings for
 both services.  It combines real, locally available MMLU-SR/GSM8K rows with
 small long-context retrieval cases whose expected answer is unambiguous.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -279,18 +279,22 @@ def main() -> int:
     parser.add_argument("--timeout-s", type=float, default=600.0)
     parser.add_argument(
         "--mmlu-path",
-        default="/home/rwkv/chase/rwkv-skills/data/mmlu_sr_question_and_answer/test.jsonl",
+        required=True,
+        help="Path to the MMLU-SR JSONL dataset.",
     )
     parser.add_argument(
         "--gsm8k-path",
-        default="/home/rwkv/chase/rwkv-skills/data/gsm8k/test.jsonl",
+        required=True,
+        help="Path to the GSM8K JSONL dataset.",
     )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     report = run(args)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    output.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     print(json.dumps({"output": str(output), "case_count": report["case_count"]}))
     return 0
 
