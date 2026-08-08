@@ -16,6 +16,78 @@ def _rapid_cuda_available() -> bool:
     not _rapid_cuda_available(),
     reason="Rapid sampler requires CUDA compute capability >= 7.",
 )
+def test_rapid_sample_request_seed_is_deterministic():
+    batch_size = 256
+    probs = torch.tensor(
+        [0.30, 0.22, 0.16, 0.12, 0.08, 0.06, 0.04, 0.02],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    logits = probs.log().expand(batch_size, -1).contiguous()
+    seeds = torch.arange(batch_size, dtype=torch.int64, device="cuda") + 17
+    positions = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+
+    first = topk_topp_sampler.rapid_sample(
+        logits, None, 1.0, seeds=seeds, positions=positions
+    )
+    second = topk_topp_sampler.rapid_sample(
+        logits, None, 1.0, seeds=seeds, positions=positions
+    )
+    different_seed = topk_topp_sampler.rapid_sample(
+        logits, None, 1.0, seeds=seeds + 1, positions=positions
+    )
+
+    assert torch.equal(first, second)
+    assert not torch.equal(first, different_seed)
+
+
+@pytest.mark.skipif(
+    not _rapid_cuda_available(),
+    reason="Rapid sampler requires CUDA compute capability >= 7.",
+)
+@pytest.mark.parametrize("per_request", [False, True])
+def test_rapid_sample_request_seed_with_penalties_is_deterministic(per_request):
+    batch_size = 128
+    probs = torch.tensor(
+        [0.30, 0.22, 0.16, 0.12, 0.08, 0.06, 0.04, 0.02],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    logits = probs.log().expand(batch_size, -1).contiguous()
+    seeds = torch.arange(batch_size, dtype=torch.int64, device="cuda") + 71
+    positions = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+    kwargs = {
+        "penalties": torch.zeros_like(logits),
+        "temperatures": torch.full((batch_size,), 0.8, device="cuda")
+        if per_request
+        else 0.8,
+        "presence_penalties": 0.0,
+        "frequency_penalties": 0.0,
+        "penalty_decays": 1.0,
+    }
+    if per_request:
+        kwargs["penalty_indices"] = torch.arange(
+            batch_size, dtype=torch.int32, device="cuda"
+        )
+
+    first = topk_topp_sampler.rapid_sample(
+        logits, None, 1.0, seeds=seeds, positions=positions, **kwargs
+    )
+    second = topk_topp_sampler.rapid_sample(
+        logits, None, 1.0, seeds=seeds, positions=positions, **kwargs
+    )
+    different_seed = topk_topp_sampler.rapid_sample(
+        logits, None, 1.0, seeds=seeds + 1, positions=positions, **kwargs
+    )
+
+    assert torch.equal(first, second)
+    assert not torch.equal(first, different_seed)
+
+
+@pytest.mark.skipif(
+    not _rapid_cuda_available(),
+    reason="Rapid sampler requires CUDA compute capability >= 7.",
+)
 @pytest.mark.parametrize(("temperature", "top_k"), [(1.0, -1), (0.7, 3)])
 def test_rapid_sample_returns_same_distribution_logprob_at_top_p_tie(
     temperature: float,

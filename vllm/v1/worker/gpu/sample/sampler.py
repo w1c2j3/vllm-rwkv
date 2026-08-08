@@ -87,10 +87,6 @@ class Sampler:
                 "rapid-sampling does not support greedy requests. "
                 "Set temperature to a positive value."
             )
-        if sampling_params.seed is not None:
-            raise RuntimeError(
-                "rapid-sampling does not support per-request seeds. Remove seed."
-            )
         if sampling_params.min_p != 0.0:
             raise RuntimeError("rapid-sampling does not support min_p. Set min_p=0.0.")
         if sampling_params.repetition_penalty != 1.0:
@@ -394,6 +390,12 @@ class Sampler:
         )
         rapid_sampled_logprobs = None
         rapid_sampled_only_fast_path = False
+        rapid_request_rng: dict[str, torch.Tensor] = {}
+        if self.sampling_states.any_explicit_seed(idx_mapping_np):
+            rapid_request_rng = {
+                "seeds": self.sampling_states.seeds.gpu[expanded_idx_mapping],
+                "positions": pos,
+            }
 
         def use_native_sampling_params():
             native_processed_logits = self.apply_sampling_params(
@@ -474,11 +476,6 @@ class Sampler:
                     "rapid-sampling does not support greedy requests. Set "
                     "VLLM_USE_RAPID_SAMPLER=0 to use the native greedy path."
                 )
-            elif self.sampling_states.any_explicit_seed(idx_mapping_np):
-                rapid_incompatibility = (
-                    "rapid-sampling does not support per-request seeds. Set "
-                    "VLLM_USE_RAPID_SAMPLER=0 to use the native seeded path."
-                )
             elif self.sampling_states.any_min_p(idx_mapping_np):
                 rapid_incompatibility = (
                     "rapid-sampling does not support min_p. Set min_p=0.0."
@@ -547,6 +544,7 @@ class Sampler:
                     penalty_decays=penalty_decays,
                     penalty_indices=expanded_idx_mapping,
                     return_logprobs=needs_processed_logprobs,
+                    **rapid_request_rng,
                 )
             else:
                 rapid_result = rapid_sample(
@@ -555,6 +553,7 @@ class Sampler:
                     top_p,
                     temperatures=temperatures,
                     return_logprobs=needs_processed_logprobs,
+                    **rapid_request_rng,
                 )
             if needs_processed_logprobs:
                 sampled, rapid_sampled_logprobs = rapid_result

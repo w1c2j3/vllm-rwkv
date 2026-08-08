@@ -67,7 +67,6 @@ def test_worker_sampler_rejects_repetition_penalty_when_rapid_is_required():
     ("sampling_params", "match"),
     [
         (SamplingParams(temperature=0.0), "greedy requests"),
-        (SamplingParams(seed=7), "per-request seeds"),
         (SamplingParams(min_p=0.1), "min_p"),
         (SamplingParams(repetition_penalty=1.2), "repetition_penalty"),
         (
@@ -136,6 +135,17 @@ def test_required_rapid_accepts_exact_sampled_processed_logprob_contract():
     sampler.logprobs_mode = "processed_logprobs"
 
     sampler.validate_sampling_params(SamplingParams(logprobs=0))
+
+
+def test_required_rapid_accepts_per_request_seed():
+    sampler = object.__new__(Sampler)
+    sampler.use_rapid = True
+    sampler.require_rapid = True
+    sampler.num_speculative_tokens = 1
+    sampler.req_states = SimpleNamespace(vocab_size=8)
+    sampler.logprobs_mode = "processed_logprobs"
+
+    sampler.validate_sampling_params(SamplingParams(seed=7))
 
 
 def test_structured_output_request_marks_rapid_as_non_fallback():
@@ -334,6 +344,8 @@ def test_rapid_sampler_returns_kernel_processed_logprob(monkeypatch, processed_d
     sampler.request_requires_rapid = np.zeros(1, dtype=bool)
 
     class FakeSamplingStates:
+        seeds = SimpleNamespace(gpu=torch.tensor([17]))
+
         def get_temperatures(
             self,
             expanded_idx_mapping,
@@ -358,7 +370,7 @@ def test_rapid_sampler_returns_kernel_processed_logprob(monkeypatch, processed_d
             return False
 
         def any_explicit_seed(self, idx_mapping_np):
-            return False
+            return True
 
         def any_min_p(self, idx_mapping_np):
             return False
@@ -385,8 +397,12 @@ def test_rapid_sampler_returns_kernel_processed_logprob(monkeypatch, processed_d
         sampler_module, "rapid_sample_input_supported", lambda logits: True
     )
 
-    def fake_rapid_sample(logits, top_k, top_p, temperatures, return_logprobs):
+    def fake_rapid_sample(
+        logits, top_k, top_p, temperatures, return_logprobs, **kwargs
+    ):
         assert logits.dtype == torch.float32
+        assert torch.equal(kwargs["seeds"], torch.tensor([17]))
+        assert torch.equal(kwargs["positions"], torch.tensor([0]))
         return torch.tensor([3]), torch.tensor([-0.75])
 
     monkeypatch.setattr(sampler_module, "rapid_sample", fake_rapid_sample)

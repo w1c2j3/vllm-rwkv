@@ -152,18 +152,32 @@ def rapid_sample(
     penalty_decays: torch.Tensor | None = None,
     penalty_indices: torch.Tensor | None = None,
     return_logprobs: bool = False,
+    seeds: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Sample with rapid CUDA and optionally return sampled-token logprobs.
 
     The optional logprob comes from the exact temperature/top-k/top-p support
     used by the sampling kernel. Recomputing it with a separate top-p
     implementation can exclude a sampled token at a threshold tie.
+
+    When ``seeds`` and ``positions`` are provided, the kernel uses a
+    stateless per-request RNG initialized from those values. This is the
+    request-level seed path used by the GPU sampler.
     """
     assert rapid_sample_input_supported(logits)
 
     logits = logits.contiguous()
     batch_size = logits.shape[0] if logits.dim() >= 2 else 1
     vocab_size = logits.shape[-1]
+    if (seeds is None) != (positions is None):
+        raise ValueError("seeds and positions must be provided together")
+    if seeds is not None:
+        assert positions is not None
+        seeds = seeds.to(device=logits.device, dtype=torch.int64).contiguous()
+        positions = positions.to(device=logits.device, dtype=torch.int64).contiguous()
+        assert seeds.shape == (batch_size,)
+        assert positions.shape == (batch_size,)
     if penalties is None:
         scalar_temperature = scalar_parameter(temperatures, 1.0)
         scalar_top_k = scalar_parameter(k, vocab_size)
@@ -176,15 +190,28 @@ def rapid_sample(
             )
         module = _load_rapid_sampler_module()
         states = _rapid_states(module, logits)
-        return _format_rapid_sample_result(
-            module.batch_sampling_temperature_topk_topp(
+        if seeds is not None:
+            result = module.batch_sampling_temperature_topk_topp_seeded(
+                logits,
+                states,
+                seeds,
+                positions,
+                float(scalar_temperature),
+                int(scalar_top_k),
+                float(scalar_top_p),
+                return_logprobs,
+            )
+        else:
+            result = module.batch_sampling_temperature_topk_topp(
                 logits,
                 states,
                 float(scalar_temperature),
                 int(scalar_top_k),
                 float(scalar_top_p),
                 return_logprobs,
-            ),
+            )
+        return _format_rapid_sample_result(
+            result,
             return_logprobs=return_logprobs,
         )
 
@@ -222,56 +249,67 @@ def rapid_sample(
             penalty_indices, batch_size, 0, torch.int32, logits.device
         )
         if per_request:
-            return _format_rapid_sample_result(
-                module.batch_sampling_repetition_temperature_topk_topp_per_request_indexed(
-                    logits,
-                    penalties,
-                    penalty_indices,
-                    states,
-                    _rapid_vector(
-                        presence_penalties,
-                        batch_size,
-                        0.0,
-                        torch.float32,
-                        logits.device,
-                    ),
-                    _rapid_vector(
-                        frequency_penalties,
-                        batch_size,
-                        0.0,
-                        torch.float32,
-                        logits.device,
-                    ),
-                    _rapid_vector(
-                        penalty_decays,
-                        batch_size,
-                        RAPID_PENALTY_DECAY_DEFAULT,
-                        torch.float32,
-                        logits.device,
-                    ),
-                    _rapid_vector(
-                        temperatures,
-                        batch_size,
-                        1.0,
-                        torch.float32,
-                        logits.device,
-                    ),
-                    _rapid_vector(
-                        k,
-                        batch_size,
-                        vocab_size,
-                        torch.int32,
-                        logits.device,
-                    ),
-                    _rapid_vector(
-                        p,
-                        batch_size,
-                        1.0,
-                        torch.float32,
-                        logits.device,
-                    ),
-                    return_logprobs,
+            sampler_name = (
+                "batch_sampling_repetition_temperature_topk_topp_per_request_indexed"
+            )
+            if seeds is not None:
+                sampler_name += "_seeded"
+                rng_args = (seeds, positions)
+            else:
+                rng_args = ()
+            sampler = getattr(module, sampler_name)
+            result = sampler(
+                logits,
+                penalties,
+                penalty_indices,
+                states,
+                *rng_args,
+                _rapid_vector(
+                    presence_penalties,
+                    batch_size,
+                    0.0,
+                    torch.float32,
+                    logits.device,
                 ),
+                _rapid_vector(
+                    frequency_penalties,
+                    batch_size,
+                    0.0,
+                    torch.float32,
+                    logits.device,
+                ),
+                _rapid_vector(
+                    penalty_decays,
+                    batch_size,
+                    RAPID_PENALTY_DECAY_DEFAULT,
+                    torch.float32,
+                    logits.device,
+                ),
+                _rapid_vector(
+                    temperatures,
+                    batch_size,
+                    1.0,
+                    torch.float32,
+                    logits.device,
+                ),
+                _rapid_vector(
+                    k,
+                    batch_size,
+                    vocab_size,
+                    torch.int32,
+                    logits.device,
+                ),
+                _rapid_vector(
+                    p,
+                    batch_size,
+                    1.0,
+                    torch.float32,
+                    logits.device,
+                ),
+                return_logprobs,
+            )
+            return _format_rapid_sample_result(
+                result,
                 return_logprobs=return_logprobs,
             )
         indexed_sampler = getattr(
@@ -284,8 +322,27 @@ def rapid_sample(
                 "rapid-sampling indexed penalty kernel is unavailable; "
                 "refusing the legacy gather/scatter path."
             )
-        return _format_rapid_sample_result(
-            indexed_sampler(
+        if seeds is not None:
+            indexed_sampler = (
+                module.batch_sampling_repetition_temperature_topk_topp_indexed_seeded
+            )
+            result = indexed_sampler(
+                logits,
+                penalties,
+                penalty_indices,
+                states,
+                seeds,
+                positions,
+                float(scalar_presence_penalty),
+                float(scalar_repetition_penalty),
+                float(scalar_penalty_decay),
+                float(scalar_temperature),
+                int(scalar_top_k),
+                float(scalar_top_p),
+                return_logprobs,
+            )
+        else:
+            result = indexed_sampler(
                 logits,
                 penalties,
                 penalty_indices,
@@ -297,14 +354,31 @@ def rapid_sample(
                 int(scalar_top_k),
                 float(scalar_top_p),
                 return_logprobs,
-            ),
+            )
+        return _format_rapid_sample_result(
+            result,
             return_logprobs=return_logprobs,
         )
 
     assert penalties.shape[0] == batch_size
 
-    return _format_rapid_sample_result(
-        module.batch_sampling_repetition_temperature_topk_topp(
+    if seeds is not None:
+        result = module.batch_sampling_repetition_temperature_topk_topp_seeded(
+            logits,
+            penalties,
+            states,
+            seeds,
+            positions,
+            float(scalar_presence_penalty),
+            float(scalar_repetition_penalty),
+            float(scalar_penalty_decay),
+            float(scalar_temperature),
+            int(scalar_top_k),
+            float(scalar_top_p),
+            return_logprobs,
+        )
+    else:
+        result = module.batch_sampling_repetition_temperature_topk_topp(
             logits,
             penalties,
             states,
@@ -315,6 +389,8 @@ def rapid_sample(
             int(scalar_top_k),
             float(scalar_top_p),
             return_logprobs,
-        ),
+        )
+    return _format_rapid_sample_result(
+        result,
         return_logprobs=return_logprobs,
     )

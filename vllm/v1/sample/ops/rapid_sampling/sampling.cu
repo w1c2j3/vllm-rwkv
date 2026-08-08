@@ -135,6 +135,19 @@ __global__ void setup_rand_kernel(RAND* states, unsigned long long seed) {
   curand_init(seed, blockIdx.x, 0, &states[blockIdx.x]);
 }
 
+__device__ __forceinline__ float4 sample_uniform4(
+    RAND* states, int b, const int64_t* seeds, const int64_t* positions) {
+  if (seeds == nullptr) {
+    return curand_uniform4(states);
+  }
+
+  RAND state;
+  curand_init(
+      static_cast<unsigned long long>(seeds[b]),
+      static_cast<unsigned long long>(positions[b]), 0, &state);
+  return curand_uniform4(&state);
+}
+
 at::Tensor setup_rand(int64_t seed, int64_t B) {
   at::Tensor state =
       at::zeros({(long)(B * sizeof(RAND))},
@@ -152,6 +165,17 @@ static void check_cuda_contiguous_1d(const at::Tensor& tensor, const char* name,
                                 " must be a contiguous CUDA tensor with shape "
                                 "(B,) and the expected dtype");
   }
+}
+
+static void check_request_random_inputs(
+    const at::Tensor* seeds, const at::Tensor* positions, int64_t batch_size) {
+  if ((seeds == nullptr) != (positions == nullptr)) {
+    throw std::invalid_argument(
+        "seeds and positions must be provided together");
+  }
+  if (seeds == nullptr) return;
+  check_cuda_contiguous_1d(*seeds, "seeds", batch_size, at::kLong);
+  check_cuda_contiguous_1d(*positions, "positions", batch_size, at::kLong);
 }
 
 #define BLOCKDIM_X_SAMPLE 1024
@@ -172,6 +196,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
         float* __restrict__ output_logprobs,      // (B,)
         RAND* __restrict__ states,                // random state, typedef
                                     // curandStatePhilox4_32_10_t RAND;
+        const int64_t* __restrict__ seeds,
+        const int64_t* __restrict__ positions,
         float* __restrict__ probs,  // probs (in L2 cache)
         const float* __restrict__ presence_penalties,
         const float* __restrict__ repetition_penalties,
@@ -417,7 +443,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
   __syncthreads();
   if (t == 0) {
     idxt = 0;
-    rand4 = curand_uniform4(states);
+    rand4 = sample_uniform4(states, b, seeds, positions);
     randp = sum_p * rand4.x;  // only once
   }
   __syncthreads();
@@ -497,10 +523,12 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
   }
 }
 
-std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp(
+static std::vector<at::Tensor>
+batch_sampling_repetition_temperature_topk_topp_impl(
     at::Tensor& logits, at::Tensor& penalties, at::Tensor& states,
     double presence_penalty, double repetition_penalty, double penalty_decay,
-    double temperature, int64_t top_k, double top_p, bool return_logprobs) {
+    double temperature, int64_t top_k, double top_p, bool return_logprobs,
+    const at::Tensor* seeds, const at::Tensor* positions) {
   int B, T, V;
   if (logits.dtype() != at::kFloat) {
     throw std::invalid_argument(
@@ -521,6 +549,11 @@ std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp(
         "B and T must be positive, got B=" + std::to_string(B) +
         ", T=" + std::to_string(T) + " !\n");
   }
+  check_request_random_inputs(seeds, positions, B);
+  const int64_t* seed_ptr =
+      seeds == nullptr ? nullptr : (int64_t*)seeds->data_ptr();
+  const int64_t* position_ptr =
+      positions == nullptr ? nullptr : (int64_t*)positions->data_ptr();
   if (!(temperature >= 0.001 && temperature <= 1000)) {
     throw std::invalid_argument("Temperature outside range, got " +
                                 std::to_string(temperature) +
@@ -560,17 +593,41 @@ std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp(
                                                            stream>>>(
       B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(), nullptr,
       (int*)out.data_ptr(), output_logprobs, (RAND*)states.data_ptr(),
-      (float*)probs.data_ptr(), nullptr, nullptr, nullptr, nullptr, nullptr,
-      nullptr, (float)presence_penalty, (float)repetition_penalty,
+      seed_ptr, position_ptr, (float*)probs.data_ptr(), nullptr, nullptr,
+      nullptr, nullptr, nullptr, nullptr, (float)presence_penalty,
+      (float)repetition_penalty,
       (float)penalty_decay, (float)temperature, (int)top_k, (float)top_p);
   return outputs;
 }
 
-std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp_indexed(
+std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp(
+    at::Tensor& logits, at::Tensor& penalties, at::Tensor& states,
+    double presence_penalty, double repetition_penalty, double penalty_decay,
+    double temperature, int64_t top_k, double top_p, bool return_logprobs) {
+  return batch_sampling_repetition_temperature_topk_topp_impl(
+      logits, penalties, states, presence_penalty, repetition_penalty,
+      penalty_decay, temperature, top_k, top_p, return_logprobs, nullptr,
+      nullptr);
+}
+
+std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp_seeded(
+    at::Tensor& logits, at::Tensor& penalties, at::Tensor& states,
+    at::Tensor& seeds, at::Tensor& positions, double presence_penalty,
+    double repetition_penalty, double penalty_decay, double temperature,
+    int64_t top_k, double top_p, bool return_logprobs) {
+  return batch_sampling_repetition_temperature_topk_topp_impl(
+      logits, penalties, states, presence_penalty, repetition_penalty,
+      penalty_decay, temperature, top_k, top_p, return_logprobs, &seeds,
+      &positions);
+}
+
+static std::vector<at::Tensor>
+batch_sampling_repetition_temperature_topk_topp_indexed_impl(
     at::Tensor& logits, at::Tensor& penalties, at::Tensor& penalty_indices,
     at::Tensor& states, double presence_penalty, double repetition_penalty,
     double penalty_decay, double temperature, int64_t top_k, double top_p,
-    bool return_logprobs) {
+    bool return_logprobs, const at::Tensor* seeds,
+    const at::Tensor* positions) {
   int B, T, V;
   if (logits.dtype() != at::kFloat) {
     throw std::invalid_argument(
@@ -602,6 +659,11 @@ std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp_indexed(
         "B and T must be positive, got B=" + std::to_string(B) +
         ", T=" + std::to_string(T) + " !\n");
   }
+  check_request_random_inputs(seeds, positions, B);
+  const int64_t* seed_ptr =
+      seeds == nullptr ? nullptr : (int64_t*)seeds->data_ptr();
+  const int64_t* position_ptr =
+      positions == nullptr ? nullptr : (int64_t*)positions->data_ptr();
   if (!(penalties.dim() == 2 && penalties.size(1) == V)) {
     throw std::invalid_argument(
         "Penalties tensor must have shape (rows, V), got dim=" +
@@ -654,20 +716,45 @@ std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp_indexed(
                                                            stream>>>(
       B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(),
       (int*)penalty_indices.data_ptr(), (int*)out.data_ptr(), output_logprobs,
-      (RAND*)states.data_ptr(), (float*)probs.data_ptr(), nullptr, nullptr,
-      nullptr, nullptr, nullptr, nullptr, (float)presence_penalty,
+      (RAND*)states.data_ptr(), seed_ptr, position_ptr,
+      (float*)probs.data_ptr(), nullptr, nullptr, nullptr, nullptr, nullptr,
+      nullptr, (float)presence_penalty,
       (float)repetition_penalty, (float)penalty_decay, (float)temperature,
       (int)top_k, (float)top_p);
   return outputs;
 }
 
+std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp_indexed(
+    at::Tensor& logits, at::Tensor& penalties, at::Tensor& penalty_indices,
+    at::Tensor& states, double presence_penalty, double repetition_penalty,
+    double penalty_decay, double temperature, int64_t top_k, double top_p,
+    bool return_logprobs) {
+  return batch_sampling_repetition_temperature_topk_topp_indexed_impl(
+      logits, penalties, penalty_indices, states, presence_penalty,
+      repetition_penalty, penalty_decay, temperature, top_k, top_p,
+      return_logprobs, nullptr, nullptr);
+}
+
 std::vector<at::Tensor>
-batch_sampling_repetition_temperature_topk_topp_per_request_indexed(
+batch_sampling_repetition_temperature_topk_topp_indexed_seeded(
+    at::Tensor& logits, at::Tensor& penalties, at::Tensor& penalty_indices,
+    at::Tensor& states, at::Tensor& seeds, at::Tensor& positions,
+    double presence_penalty, double repetition_penalty, double penalty_decay,
+    double temperature, int64_t top_k, double top_p, bool return_logprobs) {
+  return batch_sampling_repetition_temperature_topk_topp_indexed_impl(
+      logits, penalties, penalty_indices, states, presence_penalty,
+      repetition_penalty, penalty_decay, temperature, top_k, top_p,
+      return_logprobs, &seeds, &positions);
+}
+
+static std::vector<at::Tensor>
+batch_sampling_repetition_temperature_topk_topp_per_request_indexed_impl(
     at::Tensor& logits, at::Tensor& penalties, at::Tensor& penalty_indices,
     at::Tensor& states, at::Tensor& presence_penalties,
     at::Tensor& repetition_penalties, at::Tensor& penalty_decays,
     at::Tensor& temperatures, at::Tensor& top_ks, at::Tensor& top_ps,
-    bool return_logprobs) {
+    bool return_logprobs, const at::Tensor* seeds,
+    const at::Tensor* positions) {
   const int V = logits.size(-1);
   const int B = logits.dim() >= 2 ? logits.size(0) : 1;
   const int T = logits.dim() == 3 ? logits.size(1) : 1;
@@ -677,6 +764,11 @@ batch_sampling_repetition_temperature_topk_topp_per_request_indexed(
   if (!(V > 0 && V <= 1048576 && V % 4 == 0) || B <= 0 || T <= 0) {
     throw std::invalid_argument("Invalid rapid-sampling logits shape");
   }
+  check_request_random_inputs(seeds, positions, B);
+  const int64_t* seed_ptr =
+      seeds == nullptr ? nullptr : (int64_t*)seeds->data_ptr();
+  const int64_t* position_ptr =
+      positions == nullptr ? nullptr : (int64_t*)positions->data_ptr();
   if (!(penalties.dim() == 2 && penalties.size(1) == V)) {
     throw std::invalid_argument("Penalties must have shape (rows, V)");
   }
@@ -707,13 +799,40 @@ batch_sampling_repetition_temperature_topk_topp_per_request_indexed(
                                                            stream>>>(
       B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(),
       (int*)penalty_indices.data_ptr(), (int*)out.data_ptr(), output_logprobs,
-      (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
+      (RAND*)states.data_ptr(), seed_ptr, position_ptr,
+      (float*)probs.data_ptr(),
       (float*)presence_penalties.data_ptr(),
       (float*)repetition_penalties.data_ptr(),
       (float*)penalty_decays.data_ptr(), (float*)temperatures.data_ptr(),
       (int*)top_ks.data_ptr(), (float*)top_ps.data_ptr(), 0.0f, 0.0f, 1.0f,
       1.0f, V, 1.0f);
   return outputs;
+}
+
+std::vector<at::Tensor>
+batch_sampling_repetition_temperature_topk_topp_per_request_indexed(
+    at::Tensor& logits, at::Tensor& penalties, at::Tensor& penalty_indices,
+    at::Tensor& states, at::Tensor& presence_penalties,
+    at::Tensor& repetition_penalties, at::Tensor& penalty_decays,
+    at::Tensor& temperatures, at::Tensor& top_ks, at::Tensor& top_ps,
+    bool return_logprobs) {
+  return batch_sampling_repetition_temperature_topk_topp_per_request_indexed_impl(
+      logits, penalties, penalty_indices, states, presence_penalties,
+      repetition_penalties, penalty_decays, temperatures, top_ks, top_ps,
+      return_logprobs, nullptr, nullptr);
+}
+
+std::vector<at::Tensor>
+batch_sampling_repetition_temperature_topk_topp_per_request_indexed_seeded(
+    at::Tensor& logits, at::Tensor& penalties, at::Tensor& penalty_indices,
+    at::Tensor& states, at::Tensor& seeds, at::Tensor& positions,
+    at::Tensor& presence_penalties, at::Tensor& repetition_penalties,
+    at::Tensor& penalty_decays, at::Tensor& temperatures, at::Tensor& top_ks,
+    at::Tensor& top_ps, bool return_logprobs) {
+  return batch_sampling_repetition_temperature_topk_topp_per_request_indexed_impl(
+      logits, penalties, penalty_indices, states, presence_penalties,
+      repetition_penalties, penalty_decays, temperatures, top_ks, top_ps,
+      return_logprobs, &seeds, &positions);
 }
 
 __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
@@ -729,6 +848,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
         float* __restrict__ output_logprobs,  // (B,)
         RAND* __restrict__ states,            // random state, typedef
                                     // curandStatePhilox4_32_10_t RAND;
+        const int64_t* __restrict__ seeds,
+        const int64_t* __restrict__ positions,
         float* __restrict__ probs,  // probs (in L2 cache)
         const float log2e_inv_temp, const int top_k, const float top_p) {
   const int b = blockIdx.x;
@@ -930,7 +1051,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
   __syncthreads();
   if (t == 0) {
     idxt = 0;
-    rand4 = curand_uniform4(states);
+    rand4 = sample_uniform4(states, b, seeds, positions);
     randp = sum_p * rand4.x;  // only once
   }
   __syncthreads();
@@ -1001,6 +1122,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
         float* __restrict__ output_logprobs,  // (B,)
         RAND* __restrict__ states,            // random state, typedef
                                     // curandStatePhilox4_32_10_t RAND;
+        const int64_t* __restrict__ seeds,
+        const int64_t* __restrict__ positions,
         float* __restrict__ probs,  // probs (in L2 cache)
         const float top_p) {
   const int b = blockIdx.x;
@@ -1161,7 +1284,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
   __syncthreads();
   if (t == 0) {
     idxt = 0;
-    rand4 = curand_uniform4(states);
+    rand4 = sample_uniform4(states, b, seeds, positions);
     randp = sum_p * rand4.x;  // only once
   }
   __syncthreads();
@@ -1219,9 +1342,10 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
   }
 }
 
-std::vector<at::Tensor> batch_sampling_temperature_topk_topp(
+static std::vector<at::Tensor> batch_sampling_temperature_topk_topp_impl(
     at::Tensor& logits, at::Tensor& states, double temperature, int64_t top_k,
-    double top_p, bool return_logprobs) {
+    double top_p, bool return_logprobs, const at::Tensor* seeds,
+    const at::Tensor* positions) {
   int B, T, V;
   if (logits.dtype() != at::kFloat) {
     throw std::invalid_argument(
@@ -1243,6 +1367,11 @@ std::vector<at::Tensor> batch_sampling_temperature_topk_topp(
         "B and T must be positive, got B=" + std::to_string(B) +
         ", T=" + std::to_string(T) + " !\n");
   }
+  check_request_random_inputs(seeds, positions, B);
+  const int64_t* seed_ptr =
+      seeds == nullptr ? nullptr : (int64_t*)seeds->data_ptr();
+  const int64_t* position_ptr =
+      positions == nullptr ? nullptr : (int64_t*)positions->data_ptr();
   if (!(temperature >= 0.001 && temperature <= 1000)) {
     throw std::invalid_argument("Temperature outside range, got " +
                                 std::to_string(temperature) +
@@ -1282,12 +1411,30 @@ std::vector<at::Tensor> batch_sampling_temperature_topk_topp(
   if (temperature == 1 && top_k == V)
     batch_sampling_topp_kernel<<<B, 1024, 0, stream>>>(
         B, T, V, (float*)logits.data_ptr(), (int*)out.data_ptr(),
-        output_logprobs, (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
-        (float)top_p);
+        output_logprobs, (RAND*)states.data_ptr(), seed_ptr, position_ptr,
+        (float*)probs.data_ptr(), (float)top_p);
   else
     batch_sampling_temperature_topk_topp_kernel<<<B, 1024, 0, stream>>>(
         B, T, V, (float*)logits.data_ptr(), (int*)out.data_ptr(),
-        output_logprobs, (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
-        (float)log2e_inv_temp, (int)top_k, (float)top_p);
+        output_logprobs, (RAND*)states.data_ptr(), seed_ptr, position_ptr,
+        (float*)probs.data_ptr(), (float)log2e_inv_temp, (int)top_k,
+        (float)top_p);
   return outputs;
+}
+
+std::vector<at::Tensor> batch_sampling_temperature_topk_topp(
+    at::Tensor& logits, at::Tensor& states, double temperature, int64_t top_k,
+    double top_p, bool return_logprobs) {
+  return batch_sampling_temperature_topk_topp_impl(
+      logits, states, temperature, top_k, top_p, return_logprobs, nullptr,
+      nullptr);
+}
+
+std::vector<at::Tensor> batch_sampling_temperature_topk_topp_seeded(
+    at::Tensor& logits, at::Tensor& states, at::Tensor& seeds,
+    at::Tensor& positions, double temperature, int64_t top_k, double top_p,
+    bool return_logprobs) {
+  return batch_sampling_temperature_topk_topp_impl(
+      logits, states, temperature, top_k, top_p, return_logprobs, &seeds,
+      &positions);
 }
