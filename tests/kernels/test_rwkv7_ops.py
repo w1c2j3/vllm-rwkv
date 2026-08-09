@@ -82,16 +82,6 @@ def _emb_expected(args: tuple) -> list[tuple[tuple[int, ...], torch.dtype]]:
     return [(tuple(emb.shape), torch.float16)]
 
 
-def _linear_prepare_zero_expected(
-    args: tuple,
-) -> list[tuple[tuple[int, ...], torch.dtype]]:
-    x, weight, zero_features = args
-    return [
-        ((*x.shape[:-1], weight.shape[1]), x.dtype),
-        ((1, 1, zero_features), x.dtype),
-    ]
-
-
 def _shape_expected(
     shape: tuple[int, ...],
     dtype_index: int,
@@ -160,11 +150,6 @@ V3A_RETURNING_CASES = [
         "rwkv7_v3a_ops::linear_f16_m1_splitk_fp32",
         lambda d: (_h(d, (1, 8)), _h(d, (8, 64))),
         _last_dim_with_dtype(0, 64, torch.float32),
-    ),
-    OpCase(
-        "rwkv7_v3a_ops::linear_f16_m1_splitk_prepare_zero",
-        lambda d: (_h(d, (1, 8)), _h(d, (8, 64)), 16),
-        _linear_prepare_zero_expected,
     ),
     OpCase(
         "rwkv7_v3a_ops::linear_rkv_f16_m1_splitk",
@@ -448,11 +433,6 @@ FAST_RETURNING_CASES = [
         "vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows",
         lambda d: (2, 3, 128, 128, _h(d, (2, 3, 128)), _h(d, (128, 128))),
         _shape_expected((2, 3, 128), 4),
-    ),
-    OpCase(
-        "vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows_t512",
-        lambda d: (2, 3, 512, 512, _h(d, (2, 3, 512)), _h(d, (512, 512))),
-        _shape_expected((2, 3, 512), 4),
     ),
     OpCase(
         "vllm_rwkv7_fast_ops_fp16::cmix_mix",
@@ -986,132 +966,62 @@ def test_rwkv7_rkv_m1_splitk_rejects_each_misaligned_contiguous_weight(
         )
 
 
-@pytest.mark.parametrize(
-    ("hidden_size", "out_features", "zero_features"),
-    [
-        pytest.param(1024, 4096, 4096, id="ordinary-reducer"),
-        pytest.param(4096, 4096, 4096, id="warp-reducer"),
-        pytest.param(1024, 4096, 0, id="empty-zero-output"),
-    ],
-)
-def test_rwkv7_m1_splitk_prepare_zero_matches_preact_bitwise_and_writes_plus_zero(
-    hidden_size: int,
-    out_features: int,
-    zero_features: int,
-) -> None:
-    torch.manual_seed(20260731 + hidden_size + zero_features)
-    x = torch.randn(
-        (1, 1, hidden_size),
-        device="cuda",
-        dtype=torch.float16,
-    )
-    weight = torch.randn(
-        (hidden_size, out_features),
-        device="cuda",
-        dtype=torch.float16,
-    )
-    op = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero
-
-    preact, zero_output = op(x, weight, zero_features)
-    repeated_preact, repeated_zero = op(x, weight, zero_features)
-    baseline = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x, weight)
-    torch.accelerator.synchronize()
-
-    assert torch.equal(preact, baseline)
-    assert torch.equal(repeated_preact, preact)
-    assert zero_output.shape == (1, 1, zero_features)
-    assert zero_output.dtype == torch.float16
-    assert zero_output.device == x.device
-    assert zero_output.is_contiguous()
-    assert torch.count_nonzero(zero_output.view(torch.int16)) == 0
-    assert torch.count_nonzero(repeated_zero.view(torch.int16)) == 0
-
-
-def test_rwkv7_m1_splitk_prepare_zero_graph_replays_consecutively() -> None:
-    torch.manual_seed(20260731)
-    x = torch.randn((1, 1, 1024), device="cuda", dtype=torch.float16)
-    weight = torch.randn((1024, 4096), device="cuda", dtype=torch.float16)
-    op = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero
-    baseline = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x, weight)
-
-    eager_preact, eager_zero = op(x, weight, 4096)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_preact, graph_zero = op(x, weight, 4096)
-
-    replays = []
-    for _ in range(3):
-        graph_zero.fill_(1.0)
-        graph.replay()
-        replays.append(
-            (
-                graph_preact.clone(),
-                graph_zero.view(torch.int16).clone(),
-            )
-        )
-    torch.accelerator.synchronize()
-
-    assert torch.equal(eager_preact, baseline)
-    assert torch.count_nonzero(eager_zero.view(torch.int16)) == 0
-    for preact, zero_bits in replays:
-        assert torch.equal(preact, baseline)
-        assert torch.count_nonzero(zero_bits) == 0
-    assert torch.equal(replays[0][0], replays[1][0])
-    assert torch.equal(replays[1][0], replays[2][0])
-
-
-@pytest.mark.parametrize("F", [128, 256])
-def test_rwkv7_cmix_sparse_down_relu_one_out_matches_allocating_op(
-    F: int,
-) -> None:
-    torch.manual_seed(20260731 + F)
-    C = 256
-    preact = torch.randn((F,), device="cuda", dtype=torch.float16) * 0.25
+def test_rwkv7_cmix_sparse_down_deterministic_matches_reference() -> None:
+    torch.manual_seed(20260809)
+    B, T, C, F = 1, 3, 256, 384
+    preact = torch.randn((B, T, F), device="cuda", dtype=torch.float16) * 0.1
     value_fc = torch.randn((F, C), device="cuda", dtype=torch.float16) * 0.05
-    expected = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
-        C,
-        F,
-        preact,
-        value_fc,
-    )
-    actual = torch.zeros((1, 1, C), device="cuda", dtype=torch.float16)
-
-    result = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out(
-        C,
-        F,
-        preact,
-        value_fc,
-        actual,
-    )
+    outputs = [
+        torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_rows(
+            B,
+            T,
+            C,
+            F,
+            preact,
+            value_fc,
+        )
+        for _ in range(4)
+    ]
     torch.accelerator.synchronize()
 
-    assert result is None
-    if F == 128:
-        assert torch.equal(actual, expected)
-    else:
-        torch.testing.assert_close(
-            actual,
-            expected,
-            rtol=2e-3,
-            atol=2e-3,
-        )
+    assert all(torch.equal(outputs[0], output) for output in outputs[1:])
     reference = torch.relu(preact.float()).square() @ value_fc.float()
     torch.testing.assert_close(
-        actual.float().view(-1),
+        outputs[0].float(),
         reference,
         rtol=2e-2,
         atol=2e-2,
     )
 
 
-def test_rwkv7_cmix_m1_prepare_zero_full_graph_replays_consecutively() -> None:
+@pytest.mark.parametrize("tokens", [1, 16])
+def test_rwkv7_cmix_sparse_down_deterministic_is_repeatable_at_model_shape(
+    tokens: int,
+) -> None:
+    torch.manual_seed(20260809 + tokens)
+    C, F = 4096, 16384
+    preact = torch.randn((1, tokens, F), device="cuda", dtype=torch.float16) * 0.1
+    value_fc = torch.randn((F, C), device="cuda", dtype=torch.float16) * 0.05
+    if tokens == 1:
+        op = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one
+        args = (C, F, preact.view(-1), value_fc)
+    else:
+        op = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_rows
+        args = (1, tokens, C, F, preact, value_fc)
+
+    outputs = [op(*args) for _ in range(4)]
+    torch.accelerator.synchronize()
+
+    assert torch.isfinite(outputs[0]).all()
+    assert all(torch.equal(outputs[0], output) for output in outputs[1:])
+
+
+def test_rwkv7_cmix_m1_full_graph_replays_consecutively() -> None:
     torch.manual_seed(20260731)
     C, F = 256, 128
     x = torch.randn((1, 1, C), device="cuda", dtype=torch.float16)
     key_weight = torch.randn((C, F), device="cuda", dtype=torch.float16)
     value_weight = torch.randn((F, C), device="cuda", dtype=torch.float16) * 0.05
-    prepare = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero
-    sparse_out = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out
     baseline_preact = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(
         x,
         key_weight,
@@ -1125,197 +1035,25 @@ def test_rwkv7_cmix_m1_prepare_zero_full_graph_replays_consecutively() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_preact, graph_out = prepare(x, key_weight, C)
-        sparse_out(
+        graph_preact = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(
+            x,
+            key_weight,
+        )
+        graph_out = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
             C,
             F,
             graph_preact.view(-1),
             value_weight,
-            graph_out,
         )
 
     replays = []
     for _ in range(3):
-        graph_out.fill_(1.0)
         graph.replay()
         replays.append(graph_out.clone())
     torch.accelerator.synchronize()
 
     for replay in replays:
         assert torch.equal(replay, baseline)
-
-
-def test_rwkv7_cmix_sparse_down_relu_one_out_fake_meta_and_schema() -> None:
-    op = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out
-    args = (
-        256,
-        128,
-        _h("meta", (128,)),
-        _h("meta", (128, 256)),
-        _h("meta", (1, 1, 256)),
-    )
-
-    assert op(*args) is None
-    torch.library.opcheck(
-        op,
-        (
-            256,
-            128,
-            _h("cuda", (128,)),
-            _h("cuda", (128, 256)),
-            torch.zeros((1, 1, 256), device="cuda", dtype=torch.float16),
-        ),
-        test_utils=("test_schema",),
-    )
-
-
-def test_rwkv7_cmix_sparse_down_relu_one_out_bad_output_fails_closed() -> None:
-    op = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out
-    preact = _h("cuda", (128,))
-    value_fc = _h("cuda", (128, 256))
-
-    with pytest.raises(RuntimeError, match="C / 256 exceeds"):
-        op(
-            256 * (65535 + 1),
-            128,
-            preact,
-            value_fc,
-            _h("cuda", (1, 1, 256)),
-        )
-    with pytest.raises(RuntimeError, match="F / 128 exceeds"):
-        op(
-            256,
-            128 * (65535 + 1),
-            preact,
-            value_fc,
-            _h("cuda", (1, 1, 256)),
-        )
-    with pytest.raises(RuntimeError, match="C must be divisible by 256"):
-        torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
-            128,
-            128,
-            preact,
-            _h("cuda", (128, 128)),
-        )
-    with pytest.raises(RuntimeError, match="C must be divisible by 256"):
-        op(
-            128,
-            128,
-            preact,
-            _h("cuda", (128, 128)),
-            _h("cuda", (1, 1, 128)),
-        )
-    with pytest.raises(RuntimeError, match=r"shape \[1,1,C\]"):
-        op(256, 128, preact, value_fc, _h("cuda", (256,)))
-    with pytest.raises(RuntimeError, match="out must be fp16"):
-        op(
-            256,
-            128,
-            preact,
-            value_fc,
-            torch.empty((1, 1, 256), device="cuda", dtype=torch.float32),
-        )
-    with pytest.raises(RuntimeError, match="out must be contiguous"):
-        op(
-            256,
-            128,
-            preact,
-            value_fc,
-            _h("cuda", (1, 1, 512))[:, :, ::2],
-        )
-    with pytest.raises(RuntimeError, match="aligned for fp16x2"):
-        op(
-            256,
-            128,
-            preact,
-            value_fc,
-            _misaligned_contiguous_half((1, 1, 256)),
-        )
-    shared_preact_out = _h("cuda", (256,))
-    with pytest.raises(RuntimeError, match="out must not overlap preact"):
-        op(
-            256,
-            128,
-            shared_preact_out[:128],
-            value_fc,
-            shared_preact_out.view(1, 1, 256),
-        )
-    shared_value_out = _h("cuda", (128 * 256,))
-    with pytest.raises(RuntimeError, match="out must not overlap value_fc"):
-        op(
-            256,
-            128,
-            preact,
-            shared_value_out.view(128, 256),
-            shared_value_out[:256].view(1, 1, 256),
-        )
-
-
-def test_rwkv7_m1_splitk_prepare_zero_empty_inputs() -> None:
-    op = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero
-    preact, zero_output = op(
-        torch.empty((1, 1, 0), device="cuda", dtype=torch.float16),
-        torch.empty((0, 64), device="cuda", dtype=torch.float16),
-        16,
-    )
-    assert preact.shape == (1, 1, 64)
-    assert torch.count_nonzero(preact.view(torch.int16)) == 0
-    assert zero_output.shape == (1, 1, 16)
-    assert torch.count_nonzero(zero_output.view(torch.int16)) == 0
-
-    empty_preact, prepared_zero = op(
-        torch.empty((1, 1, 8), device="cuda", dtype=torch.float16),
-        torch.empty((8, 0), device="cuda", dtype=torch.float16),
-        16,
-    )
-    assert empty_preact.shape == (1, 1, 0)
-    assert empty_preact.is_contiguous()
-    assert torch.count_nonzero(prepared_zero.view(torch.int16)) == 0
-
-
-def test_rwkv7_m1_splitk_prepare_zero_bad_inputs_fail_closed() -> None:
-    op = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero
-    x = torch.empty((1, 8), device="cuda", dtype=torch.float16)
-    weight = torch.empty((8, 64), device="cuda", dtype=torch.float16)
-
-    with pytest.raises(RuntimeError, match="non-negative"):
-        op(x, weight, -8)
-    with pytest.raises(RuntimeError, match="multiple of 8"):
-        op(x, weight, 7)
-    with pytest.raises(RuntimeError, match="too large"):
-        op(x, weight, 2**31)
-    with pytest.raises(RuntimeError, match="x must be fp16"):
-        op(x.float(), weight, 8)
-    with pytest.raises(RuntimeError, match="weight must be fp16"):
-        op(x, weight.float(), 8)
-    with pytest.raises(RuntimeError, match="x must be contiguous"):
-        op(
-            torch.empty((1, 16), device="cuda", dtype=torch.float16)[:, ::2],
-            weight,
-            8,
-        )
-    with pytest.raises(RuntimeError, match="weight must be contiguous"):
-        op(
-            x,
-            torch.empty((64, 8), device="cuda", dtype=torch.float16).t(),
-            8,
-        )
-    with pytest.raises(RuntimeError, match="4-byte aligned"):
-        op(x, _misaligned_contiguous_half((8, 64)), 8)
-    with pytest.raises(RuntimeError, match="M=1"):
-        op(x.expand(2, -1).contiguous(), weight, 8)
-    with pytest.raises(RuntimeError, match="shape mismatch"):
-        op(
-            x,
-            torch.empty((9, 64), device="cuda", dtype=torch.float16),
-            8,
-        )
-    with pytest.raises(RuntimeError, match="N multiple of 64"):
-        op(
-            x,
-            torch.empty((8, 65), device="cuda", dtype=torch.float16),
-            8,
-        )
 
 
 @pytest.mark.parametrize(
@@ -1541,12 +1279,6 @@ def test_rwkv7_m1_splitk_rejects_chunk_grid_y_overflow() -> None:
     with pytest.raises(RuntimeError, match="chunks must be <= 65535"):
         torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_fp32(x, weight)
     with pytest.raises(RuntimeError, match="chunks must be <= 65535"):
-        torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero(
-            x,
-            weight,
-            8,
-        )
-    with pytest.raises(RuntimeError, match="chunks must be <= 65535"):
         torch.ops.rwkv7_v3a_ops.linear_rkv_f16_m1_splitk(
             x,
             x,
@@ -1596,7 +1328,7 @@ def test_rwkv7_rkv_m1_splitk_uses_input_device_stream() -> None:
         )
 
 
-def test_rwkv7_m1_splitk_prepare_zero_uses_cuda1_non_default_stream() -> None:
+def test_rwkv7_m1_splitk_uses_cuda1_non_default_stream() -> None:
     if torch.accelerator.device_count() < 2:
         pytest.skip("two CUDA devices are required")
     x = torch.randn((1, 1024), device="cuda:1", dtype=torch.float16)
@@ -1607,46 +1339,40 @@ def test_rwkv7_m1_splitk_prepare_zero_uses_cuda1_non_default_stream() -> None:
 
     with torch.accelerator.device_index(0), torch.cuda.stream(stream):
         assert torch.cuda.current_stream(1).cuda_stream == stream.cuda_stream
-        preact, zero_output = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero(
+        preact = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(
             x,
             weight,
-            4096,
         )
     stream.synchronize()
     baseline = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x, weight)
     torch.accelerator.synchronize(1)
 
     assert preact.device == x.device
-    assert zero_output.device == x.device
     assert torch.equal(preact, baseline)
-    assert torch.count_nonzero(zero_output.view(torch.int16)) == 0
 
     with pytest.raises(RuntimeError, match="same device"):
-        torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero(
+        torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(
             x,
             weight.to("cuda:0"),
-            4096,
         )
 
 
-def test_rwkv7_cmix_sparse_down_out_uses_cuda1_non_default_stream() -> None:
+def test_rwkv7_cmix_sparse_down_uses_cuda1_non_default_stream() -> None:
     if torch.accelerator.device_count() < 2:
         pytest.skip("two CUDA devices are required")
     C, F = 256, 128
     preact = torch.randn((F,), device="cuda:1", dtype=torch.float16)
     value_fc = torch.randn((F, C), device="cuda:1", dtype=torch.float16)
-    out = torch.zeros((1, 1, C), device="cuda:1", dtype=torch.float16)
     stream = torch.cuda.Stream(device=1)
     assert stream.cuda_stream != torch.cuda.default_stream(1).cuda_stream
 
     with torch.accelerator.device_index(0), torch.cuda.stream(stream):
         assert torch.cuda.current_stream(1).cuda_stream == stream.cuda_stream
-        torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out(
+        out = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
             C,
             F,
             preact,
             value_fc,
-            out,
         )
     stream.synchronize()
     expected = torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
@@ -1659,12 +1385,11 @@ def test_rwkv7_cmix_sparse_down_out_uses_cuda1_non_default_stream() -> None:
 
     assert torch.equal(out, expected)
     with pytest.raises(RuntimeError, match="same CUDA device"):
-        torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one_out(
+        torch.ops.vllm_rwkv7_fast_ops_fp16.cmix_sparse_down_relu_one(
             C,
             F,
             preact,
-            value_fc,
-            out.to("cuda:0"),
+            value_fc.to("cuda:0"),
         )
 
 

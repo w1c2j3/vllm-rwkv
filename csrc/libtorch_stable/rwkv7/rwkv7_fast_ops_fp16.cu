@@ -10,6 +10,8 @@
 // 63c53f4abf2cd891dd3a18c8f44f5b2cccc8c64b.
 // Source:
 // https://github.com/BlinkDL/Albatross/tree/63c53f4abf2cd891dd3a18c8f44f5b2cccc8c64b/faster3a_2607/cuda
+// The deterministic CMix sparse-down kernel follows FlashRWKV2 commit
+// 8fbee82f049f19a4c5835a99e12ba0a403db3d59.
 
 #include <assert.h>
 
@@ -47,28 +49,6 @@ bool use_3d_mix(int B, int T, int C) {
   return T > 1 && C == MIX_3D_C && B <= MIX_3D_MAX_GRID &&
          T <= MIX_3D_MAX_GRID &&
          (B >= 2 || T == 2 || T == 4 || T == 16 || T == 64 || T == 512);
-}
-
-bool use_cmix_value_split2(int B, int T) {
-  return (B == 1 &&
-          (T == 1 || T == 2 || T == 3 || T == 4 || T == 5 || T == 7)) ||
-         (T == 1 && (B == 2 || B == 3 || B == 5 || B == 7)) ||
-         (B == 2 && T == 2) || (B == 3 && T == 2);
-}
-
-bool use_cmix_t512_acc2(int B, int T) {
-  return (B == 8 && T == 1) || (B == 4 && T == 2) || (B == 3 && T == 3) ||
-         (B == 19 && T == 1);
-}
-
-bool use_cmix_t512_reuse(int B, int T) {
-  return (B == 1 && (T == 8 || T == 11 || T == 12 || T == 13 || T == 14 ||
-                     T == 15 || T == 16 || T == 17 || T == 19)) ||
-         (T == 1 && (B == 8 || B == 11 || B == 12 || B == 13 || B == 14 ||
-                     B == 16 || B == 19 || B == 20)) ||
-         (B == 2 && (T == 4 || T == 8)) || (B == 3 && (T == 3 || T == 4)) ||
-         (B == 4 && (T == 2 || T == 3 || T == 4 || T == 5)) ||
-         (B == 5 && T == 4) || (B == 8 && T == 2) || (B == 10 && T == 2);
 }
 
 __device__ inline __half2 load_h2(const dtype* ptr) {
@@ -566,13 +546,6 @@ bool is_half2_compatible(const at::Tensor& tensor) {
   return address % alignof(__half2) == 0;
 }
 
-__global__ void zero_vec4_kernel(dtype* __restrict__ out, int64_t n_vec4) {
-  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i < n_vec4) {
-    reinterpret_cast<int4*>(out)[i] = make_int4(0, 0, 0, 0);
-  }
-}
-
 template <bool UpdateShift, bool Grid3D = false>
 __global__ void cmix_mix_kernel(int T, int C, const dtype* __restrict__ x,
                                 dtype* __restrict__ shift_state,
@@ -764,99 +737,8 @@ __global__ void add_vec_2d_kernel(int C, const dtype* __restrict__ x,
   store_h2(out + idx, xv.x + vv.x, xv.y + vv.y);
 }
 
-template <bool Split2>
-__global__ __launch_bounds__(
-    FFN_SPMV_THREADS,
-    4) void cmix_sparse_spmv_relu_one_kernel(int C,
-                                             const dtype* __restrict__ preact,
-                                             const dtype* __restrict__ value_fc,
-                                             dtype* __restrict__ out) {
-  __shared__ __align__(256) __half vec_slice[FFN_TILE];
-  __shared__ __align__(256) int nnz_ids[FFN_TILE];
-  __shared__ int nnz_count;
-  __shared__ int warp_counts[FFN_TILE / 32];
-  __shared__ int warp_prefix[FFN_TILE / 32];
-
-  const int f_block = blockIdx.x;
-  const int c_block = blockIdx.y;
-  const int tid = threadIdx.x;
-  const int lane = tid & 31;
-  const int warp_id = tid >> 5;
-  const int start_f = f_block * FFN_TILE;
-
-  if (tid < FFN_TILE) {
-    const float v = fmaxf(load_h1(preact + start_f + tid), 0.0f);
-    vec_slice[tid] = __float2half_rn(v * v);
-  }
-  __syncthreads();
-
-  bool nonzero = false;
-  int local_pos = 0;
-  if (tid < FFN_TILE) {
-    nonzero = bool(__half_as_ushort(vec_slice[tid]) << 1);
-    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
-    local_pos = __popc(mask & ((1u << lane) - 1u));
-    if (lane == 0) {
-      warp_counts[warp_id] = __popc(mask);
-    }
-  }
-  __syncthreads();
-
-  if (tid == 0) {
-    int s = 0;
-#pragma unroll
-    for (int w = 0; w < FFN_TILE / 32; ++w) {
-      warp_prefix[w] = s;
-      s += warp_counts[w];
-    }
-    nnz_count = s;
-  }
-  __syncthreads();
-
-  if (tid < FFN_TILE && nonzero) {
-    nnz_ids[warp_prefix[warp_id] + local_pos] = tid;
-  }
-  __syncthreads();
-
-  __half2 acc;
-  *reinterpret_cast<int*>(&acc) = 0;
-  if constexpr (Split2) {
-    // Two independent FP16 accumulation chains shorten the loop-carried
-    // dependency. The final add deliberately matches faster3a_2607.
-    __half2 acc1;
-    *reinterpret_cast<int*>(&acc1) = 0;
-    for (int i = 0; i < nnz_count; i += 2) {
-      const int local_f0 = nnz_ids[i];
-      const __half2 mat0 = *reinterpret_cast<const __half2*>(
-          value_fc + static_cast<int64_t>(start_f + local_f0) * C +
-          c_block * (2 * FFN_SPMV_THREADS) + tid * 2);
-      acc = __hfma2(__half2half2(vec_slice[local_f0]), mat0, acc);
-      if (i + 1 < nnz_count) {
-        const int local_f1 = nnz_ids[i + 1];
-        const __half2 mat1 = *reinterpret_cast<const __half2*>(
-            value_fc + static_cast<int64_t>(start_f + local_f1) * C +
-            c_block * (2 * FFN_SPMV_THREADS) + tid * 2);
-        acc1 = __hfma2(__half2half2(vec_slice[local_f1]), mat1, acc1);
-      }
-    }
-    acc = __hadd2(acc, acc1);
-  } else {
-    for (int i = 0; i < nnz_count; ++i) {
-      const int actual_f = start_f + nnz_ids[i];
-      const __half2 mat = *reinterpret_cast<const __half2*>(
-          value_fc + static_cast<int64_t>(actual_f) * C +
-          c_block * (2 * FFN_SPMV_THREADS) + tid * 2);
-      acc = __hfma2(__half2half2(vec_slice[nnz_ids[i]]), mat, acc);
-    }
-  }
-  atomicAdd(reinterpret_cast<__half2*>(out + c_block * (2 * FFN_SPMV_THREADS) +
-                                       tid * 2),
-            acc);
-}
-
-template <bool Split2>
 __global__
-__launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_relu_rows_kernel(
+__launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_deterministic_rows_kernel(
     int C, int F, const dtype* __restrict__ preact,
     const dtype* __restrict__ value_fc, dtype* __restrict__ out) {
   __shared__ __align__(256) __half vec_slice[FFN_TILE];
@@ -865,297 +747,68 @@ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_relu_rows_kernel(
   __shared__ int warp_counts[FFN_TILE / 32];
   __shared__ int warp_prefix[FFN_TILE / 32];
 
-  const int f_block = blockIdx.x;
-  const int c_block = blockIdx.y;
-  const int row = blockIdx.z;
+  const int c_block = blockIdx.x;
+  const int row = blockIdx.y;
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp_id = tid >> 5;
-  const int start_f = f_block * FFN_TILE;
-  const dtype* pre_row = preact + static_cast<int64_t>(row) * F;
+  const dtype* preact_row = preact + static_cast<int64_t>(row) * F;
+  __half2 total;
+  *reinterpret_cast<int*>(&total) = 0;
 
-  if (tid < FFN_TILE) {
-    const float v = fmaxf(load_h1(pre_row + start_f + tid), 0.0f);
-    vec_slice[tid] = __float2half_rn(v * v);
-  }
-  __syncthreads();
+  for (int start_f = 0; start_f < F; start_f += FFN_TILE) {
+    const float value = fmaxf(load_h1(preact_row + start_f + tid), 0.0f);
+    vec_slice[tid] = __float2half_rn(value * value);
+    __syncthreads();
 
-  bool nonzero = false;
-  int local_pos = 0;
-  if (tid < FFN_TILE) {
-    nonzero = bool(__half_as_ushort(vec_slice[tid]) << 1);
+    const bool nonzero = bool(__half_as_ushort(vec_slice[tid]) << 1);
     const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
-    local_pos = __popc(mask & ((1u << lane) - 1u));
+    const int local_pos = __popc(mask & ((1u << lane) - 1u));
     if (lane == 0) {
       warp_counts[warp_id] = __popc(mask);
     }
-  }
-  __syncthreads();
+    __syncthreads();
 
-  if (tid == 0) {
-    int s = 0;
+    if (tid == 0) {
+      int prefix = 0;
 #pragma unroll
-    for (int w = 0; w < FFN_TILE / 32; ++w) {
-      warp_prefix[w] = s;
-      s += warp_counts[w];
-    }
-    nnz_count = s;
-  }
-  __syncthreads();
-
-  if (tid < FFN_TILE && nonzero) {
-    nnz_ids[warp_prefix[warp_id] + local_pos] = tid;
-  }
-  __syncthreads();
-
-  __half2 acc;
-  *reinterpret_cast<int*>(&acc) = 0;
-  if constexpr (Split2) {
-    __half2 acc1;
-    *reinterpret_cast<int*>(&acc1) = 0;
-    for (int i = 0; i < nnz_count; i += 2) {
-      const int local_f0 = nnz_ids[i];
-      const __half2 mat0 = *reinterpret_cast<const __half2*>(
-          value_fc + static_cast<int64_t>(start_f + local_f0) * C +
-          c_block * (2 * FFN_SPMV_THREADS) + tid * 2);
-      acc = __hfma2(__half2half2(vec_slice[local_f0]), mat0, acc);
-      if (i + 1 < nnz_count) {
-        const int local_f1 = nnz_ids[i + 1];
-        const __half2 mat1 = *reinterpret_cast<const __half2*>(
-            value_fc + static_cast<int64_t>(start_f + local_f1) * C +
-            c_block * (2 * FFN_SPMV_THREADS) + tid * 2);
-        acc1 = __hfma2(__half2half2(vec_slice[local_f1]), mat1, acc1);
+      for (int warp = 0; warp < FFN_TILE / 32; ++warp) {
+        warp_prefix[warp] = prefix;
+        prefix += warp_counts[warp];
       }
+      nnz_count = prefix;
     }
-    acc = __hadd2(acc, acc1);
-  } else {
-    for (int i = 0; i < nnz_count; ++i) {
-      const int actual_f = start_f + nnz_ids[i];
-      const __half2 mat = *reinterpret_cast<const __half2*>(
-          value_fc + static_cast<int64_t>(actual_f) * C +
-          c_block * (2 * FFN_SPMV_THREADS) + tid * 2);
-      acc = __hfma2(__half2half2(vec_slice[nnz_ids[i]]), mat, acc);
-    }
-  }
-  atomicAdd(
-      reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C +
-                                 c_block * (2 * FFN_SPMV_THREADS) + tid * 2),
-      acc);
-}
+    __syncthreads();
 
-template <int Accumulators>
-__global__
-__launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_kernel(
-    int C, int F, const dtype* __restrict__ preact,
-    const dtype* __restrict__ value_fc, dtype* __restrict__ out) {
-  constexpr int TILE = 512;
-  constexpr int THREADS = 256;
-  __shared__ __align__(256) __half vec_slice[TILE];
-  __shared__ __align__(256) int nnz_ids[TILE];
-  __shared__ int nnz_count;
-  __shared__ int warp_counts[TILE / 32];
-  __shared__ int warp_prefix[TILE / 32];
-
-  const int f_block = blockIdx.x;
-  const int c_block = blockIdx.y;
-  const int row = blockIdx.z;
-  const int tid = threadIdx.x;
-  const int lane = tid & 31;
-  const int warp_id = tid >> 5;
-  const int start_f = f_block * TILE;
-  const dtype* pre_row = preact + static_cast<int64_t>(row) * F;
-
-#pragma unroll
-  for (int u = 0; u < 2; ++u) {
-    const int local_f = tid + u * THREADS;
-    const float v = fmaxf(load_h1(pre_row + start_f + local_f), 0.0f);
-    vec_slice[local_f] = __float2half_rn(v * v);
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int u = 0; u < 2; ++u) {
-    const int local_f = tid + u * THREADS;
-    const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
-    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
-    if (lane == 0) {
-      warp_counts[warp_id + u * (THREADS / 32)] = __popc(mask);
-    }
-  }
-  __syncthreads();
-
-  if (tid == 0) {
-    int s = 0;
-#pragma unroll
-    for (int w = 0; w < TILE / 32; ++w) {
-      warp_prefix[w] = s;
-      s += warp_counts[w];
-    }
-    nnz_count = s;
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int u = 0; u < 2; ++u) {
-    const int local_f = tid + u * THREADS;
-    const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
-    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
-    const int local_pos = __popc(mask & ((1u << lane) - 1u));
-    const int group = warp_id + u * (THREADS / 32);
     if (nonzero) {
-      nnz_ids[warp_prefix[group] + local_pos] = local_f;
+      nnz_ids[warp_prefix[warp_id] + local_pos] = tid;
     }
-  }
-  __syncthreads();
+    __syncthreads();
 
-  __half2 acc;
-  *reinterpret_cast<int*>(&acc) = 0;
-  if constexpr (Accumulators == 1) {
+    __half2 tile;
+    *reinterpret_cast<int*>(&tile) = 0;
     for (int i = 0; i < nnz_count; ++i) {
       const int local_f = nnz_ids[i];
       const __half2 mat = *reinterpret_cast<const __half2*>(
           value_fc + static_cast<int64_t>(start_f + local_f) * C +
-          c_block * (2 * THREADS) + tid * 2);
-      acc = __hfma2(__half2half2(vec_slice[local_f]), mat, acc);
+          c_block * (2 * FFN_SPMV_THREADS) + tid * 2);
+      tile = __hfma2(__half2half2(vec_slice[local_f]), mat, tile);
     }
-  } else {
-    static_assert(Accumulators == 2,
-                  "production t512 supports one or two accumulators");
-    __half2 acc1;
-    *reinterpret_cast<int*>(&acc1) = 0;
-    for (int i = 0; i < nnz_count; i += 2) {
-      const int local_f0 = nnz_ids[i];
-      const __half2 mat0 = *reinterpret_cast<const __half2*>(
-          value_fc + static_cast<int64_t>(start_f + local_f0) * C +
-          c_block * (2 * THREADS) + tid * 2);
-      acc = __hfma2(__half2half2(vec_slice[local_f0]), mat0, acc);
-      if (i + 1 < nnz_count) {
-        const int local_f1 = nnz_ids[i + 1];
-        const __half2 mat1 = *reinterpret_cast<const __half2*>(
-            value_fc + static_cast<int64_t>(start_f + local_f1) * C +
-            c_block * (2 * THREADS) + tid * 2);
-        acc1 = __hfma2(__half2half2(vec_slice[local_f1]), mat1, acc1);
-      }
-    }
-    acc = __hadd2(acc, acc1);
+    total = __hadd2(total, tile);
+    __syncthreads();
   }
-  atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C +
-                                       c_block * (2 * THREADS) + tid * 2),
-            acc);
+
+  *reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C +
+                              c_block * (2 * FFN_SPMV_THREADS) + tid * 2) =
+      total;
 }
 
-template <int Accumulators>
-__global__
-__launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_reuse_kernel(
-    int C, int F, const dtype* __restrict__ preact,
-    const dtype* __restrict__ value_fc, dtype* __restrict__ out) {
-  static_assert(Accumulators == 1 || Accumulators == 2,
-                "unsupported reuse accumulator count");
-  constexpr int TILE = 512;
-  constexpr int THREADS = 256;
-  constexpr int WARPS = THREADS / 32;
-  __shared__ __align__(256) __half vec_slice[TILE];
-  __shared__ __align__(256) int nnz_ids[TILE];
-  __shared__ int nnz_count;
-  __shared__ int warp_counts[TILE / 32];
-  __shared__ int warp_prefix[TILE / 32];
-
-  const int f_block = blockIdx.x;
-  const int c_block = blockIdx.y;
-  const int row = blockIdx.z;
-  const int tid = threadIdx.x;
-  const int lane = tid & 31;
-  const int warp_id = tid >> 5;
-  const int start_f = f_block * TILE;
-  const dtype* pre_row = preact + static_cast<int64_t>(row) * F;
-
-#pragma unroll
-  for (int u = 0; u < 2; ++u) {
-    const int local_f = tid + u * THREADS;
-    const float v = fmaxf(load_h1(pre_row + start_f + local_f), 0.0f);
-    vec_slice[local_f] = __float2half_rn(v * v);
-  }
-  __syncthreads();
-
-  // Preserve each warp ballot across the prefix scan so the compaction pass
-  // does not reload, retest, and re-ballot the same values.
-  unsigned masks[2];
-#pragma unroll
-  for (int u = 0; u < 2; ++u) {
-    const int local_f = tid + u * THREADS;
-    const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
-    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
-    masks[u] = mask;
-    if (lane == 0) {
-      warp_counts[warp_id + u * WARPS] = __popc(mask);
-    }
-  }
-  __syncthreads();
-
-  if (tid == 0) {
-    int count = 0;
-#pragma unroll
-    for (int warp = 0; warp < TILE / 32; ++warp) {
-      warp_prefix[warp] = count;
-      count += warp_counts[warp];
-    }
-    nnz_count = count;
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int u = 0; u < 2; ++u) {
-    const int local_f = tid + u * THREADS;
-    const unsigned mask = masks[u];
-    const bool nonzero = (mask & (1u << lane)) != 0;
-    const int local_pos = __popc(mask & ((1u << lane) - 1u));
-    const int group = warp_id + u * WARPS;
-    if (nonzero) {
-      nnz_ids[warp_prefix[group] + local_pos] = local_f;
-    }
-  }
-  __syncthreads();
-
-  __half2 acc;
-  *reinterpret_cast<int*>(&acc) = 0;
-  if constexpr (Accumulators == 1) {
-    for (int i = 0; i < nnz_count; ++i) {
-      const int local_f = nnz_ids[i];
-      const __half2 mat = *reinterpret_cast<const __half2*>(
-          value_fc + static_cast<int64_t>(start_f + local_f) * C +
-          c_block * (2 * THREADS) + tid * 2);
-      acc = __hfma2(__half2half2(vec_slice[local_f]), mat, acc);
-    }
-  } else {
-    __half2 acc1;
-    *reinterpret_cast<int*>(&acc1) = 0;
-    for (int i = 0; i < nnz_count; i += 2) {
-      const int local_f0 = nnz_ids[i];
-      const __half2 mat0 = *reinterpret_cast<const __half2*>(
-          value_fc + static_cast<int64_t>(start_f + local_f0) * C +
-          c_block * (2 * THREADS) + tid * 2);
-      acc = __hfma2(__half2half2(vec_slice[local_f0]), mat0, acc);
-      if (i + 1 < nnz_count) {
-        const int local_f1 = nnz_ids[i + 1];
-        const __half2 mat1 = *reinterpret_cast<const __half2*>(
-            value_fc + static_cast<int64_t>(start_f + local_f1) * C +
-            c_block * (2 * THREADS) + tid * 2);
-        acc1 = __hfma2(__half2half2(vec_slice[local_f1]), mat1, acc1);
-      }
-    }
-    acc = __hadd2(acc, acc1);
-  }
-  atomicAdd(reinterpret_cast<__half2*>(out + static_cast<int64_t>(row) * C +
-                                       c_block * (2 * THREADS) + tid * 2),
-            acc);
-}
-
-void launch_cmix_sparse_down_relu_one(int C, int F, const dtype* preact,
-                                      const dtype* value_fc, dtype* out,
-                                      cudaStream_t stream) {
-  cmix_sparse_spmv_relu_one_kernel<true>
-      <<<dim3(F / FFN_TILE, C / (2 * FFN_SPMV_THREADS), 1), FFN_SPMV_THREADS, 0,
-         stream>>>(C, preact, value_fc, out);
+void launch_cmix_sparse_down_relu(int rows, int C, int F, const dtype* preact,
+                                  const dtype* value_fc, dtype* out,
+                                  cudaStream_t stream) {
+  cmix_sparse_spmv_deterministic_rows_kernel<<<
+      dim3(C / (2 * FFN_SPMV_THREADS), rows), FFN_SPMV_THREADS, 0, stream>>>(
+      C, F, preact, value_fc, out);
 }
 
 }  // namespace
@@ -1469,23 +1122,11 @@ at::Tensor cmix_sparse_down_relu_one_cuda(int C, int F, at::Tensor preact,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(preact));
   auto out = at::empty({1, 1, C}, preact.options());
   auto stream = at::cuda::getCurrentCUDAStream();
-  zero_vec4_kernel<<<(C / 8 + 127) / 128, 128, 0, stream>>>(
-      out.data_ptr<dtype>(), C / 8);
-  launch_cmix_sparse_down_relu_one(C, F, preact.data_ptr<dtype>(),
-                                   value_fc.data_ptr<dtype>(),
-                                   out.data_ptr<dtype>(), stream);
+  launch_cmix_sparse_down_relu(1, C, F, preact.data_ptr<dtype>(),
+                               value_fc.data_ptr<dtype>(),
+                               out.data_ptr<dtype>(), stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
-}
-
-void cmix_sparse_down_relu_one_out_cuda(int C, int F, at::Tensor preact,
-                                        at::Tensor value_fc, at::Tensor out) {
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(preact));
-  auto stream = at::cuda::getCurrentCUDAStream();
-  launch_cmix_sparse_down_relu_one(C, F, preact.data_ptr<dtype>(),
-                                   value_fc.data_ptr<dtype>(),
-                                   out.data_ptr<dtype>(), stream);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 at::Tensor cmix_sparse_down_relu_rows_cuda(int B, int T, int C, int F,
@@ -1494,59 +1135,9 @@ at::Tensor cmix_sparse_down_relu_rows_cuda(int B, int T, int C, int F,
   const int rows = B * T;
   auto out = at::empty({B, T, C}, preact.options());
   auto stream = at::cuda::getCurrentCUDAStream();
-  const int64_t out_vec4 = static_cast<int64_t>(rows) * (C / 8);
-  zero_vec4_kernel<<<static_cast<int>(ceil_div(out_vec4, 128)), 128, 0,
-                     stream>>>(out.data_ptr<dtype>(), out_vec4);
-  if (use_cmix_value_split2(B, T)) {
-    cmix_sparse_spmv_relu_rows_kernel<true>
-        <<<dim3(F / FFN_TILE, C / (2 * FFN_SPMV_THREADS), rows),
-           FFN_SPMV_THREADS, 0, stream>>>(C, F, preact.data_ptr<dtype>(),
-                                          value_fc.data_ptr<dtype>(),
-                                          out.data_ptr<dtype>());
-  } else {
-    cmix_sparse_spmv_relu_rows_kernel<false>
-        <<<dim3(F / FFN_TILE, C / (2 * FFN_SPMV_THREADS), rows),
-           FFN_SPMV_THREADS, 0, stream>>>(C, F, preact.data_ptr<dtype>(),
-                                          value_fc.data_ptr<dtype>(),
-                                          out.data_ptr<dtype>());
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-at::Tensor cmix_sparse_down_relu_rows_t512_cuda(int B, int T, int C, int F,
-                                                at::Tensor preact,
-                                                at::Tensor value_fc) {
-  const int rows = B * T;
-  auto out = at::empty({B, T, C}, preact.options());
-  auto stream = at::cuda::getCurrentCUDAStream();
-  const int64_t out_vec4 = static_cast<int64_t>(rows) * (C / 8);
-  zero_vec4_kernel<<<static_cast<int>(ceil_div(out_vec4, 128)), 128, 0,
-                     stream>>>(out.data_ptr<dtype>(), out_vec4);
-  const bool acc2 = use_cmix_t512_acc2(B, T);
-  if (use_cmix_t512_reuse(B, T)) {
-    if (acc2) {
-      cmix_sparse_spmv_relu_rows_t512_reuse_kernel<2>
-          <<<dim3(F / 512, C / 512, rows), 256, 0, stream>>>(
-              C, F, preact.data_ptr<dtype>(), value_fc.data_ptr<dtype>(),
-              out.data_ptr<dtype>());
-    } else {
-      cmix_sparse_spmv_relu_rows_t512_reuse_kernel<1>
-          <<<dim3(F / 512, C / 512, rows), 256, 0, stream>>>(
-              C, F, preact.data_ptr<dtype>(), value_fc.data_ptr<dtype>(),
-              out.data_ptr<dtype>());
-    }
-  } else if (acc2) {
-    cmix_sparse_spmv_relu_rows_t512_kernel<2>
-        <<<dim3(F / 512, C / 512, rows), 256, 0, stream>>>(
-            C, F, preact.data_ptr<dtype>(), value_fc.data_ptr<dtype>(),
-            out.data_ptr<dtype>());
-  } else {
-    cmix_sparse_spmv_relu_rows_t512_kernel<1>
-        <<<dim3(F / 512, C / 512, rows), 256, 0, stream>>>(
-            C, F, preact.data_ptr<dtype>(), value_fc.data_ptr<dtype>(),
-            out.data_ptr<dtype>());
-  }
+  launch_cmix_sparse_down_relu(rows, C, F, preact.data_ptr<dtype>(),
+                               value_fc.data_ptr<dtype>(),
+                               out.data_ptr<dtype>(), stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }

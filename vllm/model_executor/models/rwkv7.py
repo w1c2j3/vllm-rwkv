@@ -79,7 +79,6 @@ LOWRANK_OUT_FP16_LT_4096 = {
 }
 CMIX_NOFC_ROW20_MAX_T = 5
 CMIX_NOFC_MAX_ROWS = 19
-CMIX_NOFC_T512_MIN_ROWS = 8
 LN1_TMIX_FUSE = True
 # The fused LN1/TMix owner is strongest for M=1 and for larger decode batches,
 # but paired full-model measurements favor the separate kernels at these exact
@@ -94,9 +93,6 @@ MIX_3D_B1_T_4096 = frozenset((2, 4, 16, 64, 512))
 # The direct-model harness clears this exact row set for paired A/B capture;
 # production keeps M=1 grouped without a user-visible mode or fallback knob.
 M1_RKV_GROUPED_ROWS = {1}
-# The M=1 no-fc path prepares the sparse-down accumulator while reducing the
-# FFN key split-K result, eliminating one zeroing launch per layer.
-M1_CMIX_PREZERO_ROWS = {1}
 
 
 @dataclass(frozen=True)
@@ -2584,20 +2580,6 @@ class RWKV7ForCausalLM(nn.Module):
             can_use_m1_splitk = (
                 mixed.numel() == mixed.size(-1) and key_weight.size(1) % 64 == 0
             )
-            if path.rows in M1_CMIX_PREZERO_ROWS and can_use_m1_splitk:
-                hid, out = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk_prepare_zero(
-                    mixed.contiguous(),
-                    key_weight,
-                    self.hidden_size,
-                )
-                ops.cmix_sparse_down_relu_one_out(
-                    self.hidden_size,
-                    value_weight.size(0),
-                    hid.view(-1).contiguous(),
-                    value_weight,
-                    out,
-                )
-                return self._tp_all_reduce(out)
             if can_use_m1_splitk:
                 hid = torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(
                     mixed.contiguous(),
@@ -2616,21 +2598,6 @@ class RWKV7ForCausalLM(nn.Module):
         hid = self.linear(mixed, z[p + "key.weight"])
         if path.cmix_mode == CMIX_ROWS2_NOFC:
             F = z[p + "value.weight"].size(0)
-            if (
-                path.rows >= CMIX_NOFC_T512_MIN_ROWS
-                and self.hidden_size % 512 == 0
-                and F % 512 == 0
-            ):
-                return self._tp_all_reduce(
-                    ops.cmix_sparse_down_relu_rows_t512(
-                        B,
-                        T,
-                        self.hidden_size,
-                        F,
-                        hid.contiguous(),
-                        z[p + "value.weight"],
-                    )
-                )
             return self._tp_all_reduce(
                 ops.cmix_sparse_down_relu_rows(
                     B,

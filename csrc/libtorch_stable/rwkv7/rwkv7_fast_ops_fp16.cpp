@@ -59,17 +59,10 @@ torch::Tensor tmix_vres_gate_cuda(int B, int T, int C, torch::Tensor v,
 
 torch::Tensor cmix_sparse_down_relu_one_cuda(int C, int F, torch::Tensor preact,
                                              torch::Tensor value_fc);
-void cmix_sparse_down_relu_one_out_cuda(int C, int F, torch::Tensor preact,
-                                        torch::Tensor value_fc,
-                                        torch::Tensor out);
 
 torch::Tensor cmix_sparse_down_relu_rows_cuda(int B, int T, int C, int F,
                                               torch::Tensor preact,
                                               torch::Tensor value_fc);
-
-torch::Tensor cmix_sparse_down_relu_rows_t512_cuda(int B, int T, int C, int F,
-                                                   torch::Tensor preact,
-                                                   torch::Tensor value_fc);
 
 torch::Tensor cmix_mix_cuda(int B, int T, int C, torch::Tensor x,
                             torch::Tensor shift_state, torch::Tensor x_k);
@@ -430,21 +423,6 @@ torch::Tensor cmix_sparse_down_relu_one(int64_t C, int64_t F,
       checked_int_arg(C, "C"), checked_int_arg(F, "F"), preact, value_fc);
 }
 
-void cmix_sparse_down_relu_one_out(int64_t C, int64_t F, torch::Tensor preact,
-                                   torch::Tensor value_fc, torch::Tensor out) {
-  check_cmix_sparse_down_relu_one_inputs(C, F, preact, value_fc);
-  check_half_cuda_contig(out, "out");
-  TORCH_CHECK(out.dim() == 3 && out.size(0) == 1 && out.size(1) == 1 &&
-                  out.size(2) == C,
-              "out must have shape [1,1,C]");
-  check_half2_aligned(out, "out");
-  check_same_device(preact, out, "out");
-  TORCH_CHECK(!out.is_alias_of(preact), "out must not overlap preact");
-  TORCH_CHECK(!out.is_alias_of(value_fc), "out must not overlap value_fc");
-  cmix_sparse_down_relu_one_out_cuda(
-      checked_int_arg(C, "C"), checked_int_arg(F, "F"), preact, value_fc, out);
-}
-
 torch::Tensor cmix_sparse_down_relu_rows(int64_t B, int64_t T, int64_t C,
                                          int64_t F, torch::Tensor preact,
                                          torch::Tensor value_fc) {
@@ -456,21 +434,6 @@ torch::Tensor cmix_sparse_down_relu_rows(int64_t B, int64_t T, int64_t C,
   TORCH_CHECK((C % 256) == 0, "C must be divisible by 256");
   TORCH_CHECK((F % 128) == 0, "F must be divisible by 128");
   return cmix_sparse_down_relu_rows_cuda(
-      checked_int_arg(B, "B"), checked_int_arg(T, "T"), checked_int_arg(C, "C"),
-      checked_int_arg(F, "F"), preact, value_fc);
-}
-
-torch::Tensor cmix_sparse_down_relu_rows_t512(int64_t B, int64_t T, int64_t C,
-                                              int64_t F, torch::Tensor preact,
-                                              torch::Tensor value_fc) {
-  check_3d(preact, B, T, F, "preact");
-  check_half_cuda_contig(value_fc, "value_fc");
-  TORCH_CHECK(
-      value_fc.dim() == 2 && value_fc.size(0) == F && value_fc.size(1) == C,
-      "value_fc must have shape [F,C]");
-  TORCH_CHECK((C % 512) == 0, "C must be divisible by 512");
-  TORCH_CHECK((F % 512) == 0, "F must be divisible by 512");
-  return cmix_sparse_down_relu_rows_t512_cuda(
       checked_int_arg(B, "B"), checked_int_arg(T, "T"), checked_int_arg(C, "C"),
       checked_int_arg(F, "F"), preact, value_fc);
 }
@@ -608,14 +571,8 @@ TORCH_LIBRARY(vllm_rwkv7_fast_ops_fp16, m) {
       "cmix_sparse_down_relu_one(int C, int F, Tensor preact, Tensor value_fc) "
       "-> Tensor");
   m.def(
-      "cmix_sparse_down_relu_one_out(int C, int F, Tensor preact, Tensor "
-      "value_fc, Tensor(a!) out) -> ()");
-  m.def(
       "cmix_sparse_down_relu_rows(int B, int T, int C, int F, Tensor preact, "
       "Tensor value_fc) -> Tensor");
-  m.def(
-      "cmix_sparse_down_relu_rows_t512(int B, int T, int C, int F, Tensor "
-      "preact, Tensor value_fc) -> Tensor");
   m.def(
       "cmix_mix(int B, int T, int C, Tensor x, Tensor(a!) shift_state, Tensor "
       "x_k) -> Tensor");
@@ -647,9 +604,7 @@ TORCH_LIBRARY_IMPL(vllm_rwkv7_fast_ops_fp16, CUDA, m) {
   m.impl("tmix_lnx_rkvres_xg_warp", &tmix_lnx_rkvres_xg_warp);
   m.impl("tmix_vres_gate", &tmix_vres_gate);
   m.impl("cmix_sparse_down_relu_one", &cmix_sparse_down_relu_one);
-  m.impl("cmix_sparse_down_relu_one_out", &cmix_sparse_down_relu_one_out);
   m.impl("cmix_sparse_down_relu_rows", &cmix_sparse_down_relu_rows);
-  m.impl("cmix_sparse_down_relu_rows_t512", &cmix_sparse_down_relu_rows_t512);
   m.impl("cmix_mix", &cmix_mix);
   m.impl("cmix_mix_3d", &cmix_mix_3d);
   m.impl("cmix_mix_slot", &cmix_mix_slot);

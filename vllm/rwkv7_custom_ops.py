@@ -118,22 +118,6 @@ def _rwkv7_linear_f16_m1_splitk_fp32_fake(
     )
 
 
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk_prepare_zero")
-def _rwkv7_linear_f16_m1_splitk_prepare_zero_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    zero_features: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        _rwkv7_linear_out(x, weight.shape[1]),
-        torch.empty(
-            (1, 1, zero_features),
-            device=x.device,
-            dtype=x.dtype,
-        ),
-    )
-
-
 @_register_fake_if_exists("rwkv7_v3a_ops::linear_t_f16")
 def _rwkv7_linear_t_f16_fake(
     x: torch.Tensor,
@@ -440,19 +424,7 @@ def _rwkv7_cmix_sparse_down_relu_one_fake(
     return torch.empty((1, 1, C), device=preact.device, dtype=preact.dtype)
 
 
-@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_one_out")
-def _rwkv7_cmix_sparse_down_relu_one_out_fake(
-    C: int,
-    F: int,
-    preact: torch.Tensor,
-    value_fc: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    return None
-
-
 @_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows")
-@_register_fake_if_exists("vllm_rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows_t512")
 def _rwkv7_cmix_sparse_down_relu_rows_fake(
     B: int,
     T: int,

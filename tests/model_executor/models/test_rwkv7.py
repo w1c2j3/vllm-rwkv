@@ -1481,78 +1481,13 @@ def test_rwkv7_project_att_rkv_can_disable_grouped_route_for_benchmark(
     assert calls == [(inputs[index], weights[index]) for index in range(3)]
 
 
-def test_rwkv7_cmix_m1_prepares_sparse_accumulator_during_splitk(
+@pytest.mark.parametrize("out_features", [64, 65])
+def test_rwkv7_cmix_m1_uses_single_sparse_down_path(
     monkeypatch,
+    out_features,
 ):
     model = _new_rwkv7_forward_test_model(hidden_size=8)
     prefix = "blocks.0.ffn."
-    key_weight = torch.empty((8, 64), device="meta", dtype=torch.float16)
-    value_weight = torch.empty((64, 8), device="meta", dtype=torch.float16)
-    mixed = torch.empty((1, 1, 8), device="meta", dtype=torch.float16)
-    hid = torch.empty((1, 1, 64), device="meta", dtype=torch.float16)
-    sparse_out = torch.empty((1, 1, 8), device="meta", dtype=torch.float16)
-    seen: dict[str, tuple[Any, ...]] = {}
-    model.z = {
-        prefix + "key.weight": key_weight,
-        prefix + "value.weight": value_weight,
-    }
-    model._tp_all_reduce = lambda value: value
-    model.linear = lambda *_args: pytest.fail(
-        "exact M1 no-fc must use split-K prepare-zero"
-    )
-
-    def prepare_zero(value, weight, zero_features):
-        seen["prepare_zero"] = (value, weight, zero_features)
-        return hid, sparse_out
-
-    def sparse_down_out(C, F, preact, weight, out):
-        seen["sparse_down_out"] = (C, F, preact, weight, out)
-
-    monkeypatch.setattr(
-        torch.ops.rwkv7_v3a_ops,
-        "linear_f16_m1_splitk_prepare_zero",
-        prepare_zero,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        torch.ops.vllm_rwkv7_fast_ops_fp16,
-        "cmix_sparse_down_relu_one_out",
-        sparse_down_out,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        torch.ops.vllm_rwkv7_fast_ops_fp16,
-        "cmix_sparse_down_relu_one",
-        lambda *_args: pytest.fail("prezero route must skip the zeroing op"),
-        raising=False,
-    )
-
-    output = model.cmix_from_mixed(
-        mixed,
-        prefix,
-        rwkv7.PathConfig(1, rwkv7.CMIX_B1T1_NOFC),
-    )
-
-    assert output is sparse_out
-    prepared_x, prepared_weight, zero_features = seen["prepare_zero"]
-    assert prepared_x is mixed
-    assert prepared_weight is key_weight
-    assert zero_features == 8
-    C, F, preact, sparse_weight, out = seen["sparse_down_out"]
-    assert (C, F) == (8, 64)
-    assert tuple(preact.shape) == (64,)
-    assert sparse_weight is value_weight
-    assert out is sparse_out
-
-
-@pytest.mark.parametrize("disable_tuning", [False, True])
-def test_rwkv7_cmix_m1_falls_back_to_independent_zero_path(
-    monkeypatch,
-    disable_tuning,
-):
-    model = _new_rwkv7_forward_test_model(hidden_size=8)
-    prefix = "blocks.0.ffn."
-    out_features = 64 if disable_tuning else 65
     key_weight = torch.empty((8, out_features), device="meta", dtype=torch.float16)
     value_weight = torch.empty((out_features, 8), device="meta", dtype=torch.float16)
     mixed = torch.empty((1, 1, 8), device="meta", dtype=torch.float16)
@@ -1564,8 +1499,6 @@ def test_rwkv7_cmix_m1_falls_back_to_independent_zero_path(
         prefix + "value.weight": value_weight,
     }
     model._tp_all_reduce = lambda value: value
-    if disable_tuning:
-        monkeypatch.setattr(rwkv7, "M1_CMIX_PREZERO_ROWS", set())
 
     def linear(value, weight):
         seen["linear"] = (value, weight)
@@ -1582,20 +1515,8 @@ def test_rwkv7_cmix_m1_falls_back_to_independent_zero_path(
     model.linear = linear
     monkeypatch.setattr(
         torch.ops.rwkv7_v3a_ops,
-        "linear_f16_m1_splitk_prepare_zero",
-        lambda *_args: pytest.fail("fallback must not prepare sparse output"),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        torch.ops.rwkv7_v3a_ops,
         "linear_f16_m1_splitk",
         splitk,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        torch.ops.vllm_rwkv7_fast_ops_fp16,
-        "cmix_sparse_down_relu_one_out",
-        lambda *_args: pytest.fail("fallback must use independent zero path"),
         raising=False,
     )
     monkeypatch.setattr(
@@ -1612,12 +1533,12 @@ def test_rwkv7_cmix_m1_falls_back_to_independent_zero_path(
     )
 
     assert output is sparse_out
-    projection = "splitk" if disable_tuning else "linear"
+    projection = "splitk" if out_features == 64 else "linear"
     projected_x, projected_weight = seen[projection]
     assert projected_x is mixed
     assert projected_weight is key_weight
-    assert ("linear" in seen) == (not disable_tuning)
-    assert ("splitk" in seen) == disable_tuning
+    assert ("linear" in seen) == (out_features == 65)
+    assert ("splitk" in seen) == (out_features == 64)
     C, F, preact, sparse_weight = seen["sparse_down"]
     assert (8, out_features) == (C, F)
     assert tuple(preact.shape) == (out_features,)
